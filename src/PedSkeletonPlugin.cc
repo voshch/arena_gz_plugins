@@ -10,10 +10,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include <gz/math/Pose3.hh>
 #include <gz/math/Quaternion.hh>
@@ -41,8 +44,11 @@ using namespace std::chrono_literals;
 // walk.dae zeroes its root under followTrajectory, dropping the ~1.01 m hips onto
 // the actor origin, so lift the origin to plant the feet at the ped ground z.
 static constexpr double kZOffset = 1.01;
-// Animation clip name, must match <animation name="..."> in the actor SDF.
-static constexpr const char * kAnimName = "walk";
+// Clip played while moving, must match <animation name="..."> in the actor SDF.
+static constexpr const char * kWalkAnimName = "walk";
+// Stationary stand clip played while idle, so the body stands instead of holding
+// a frozen walk frame. Advances in real time so its light motion keeps playing.
+static constexpr const char * kIdleAnimName = "idle";
 // walk.dae advances its root 1.384 m over its 5.79 s clip, a 0.239 m/s natural
 // stride, so the cursor advances speed/0.239 per second to keep the feet planted.
 static constexpr double kWalkRefSpeed = 0.239;
@@ -79,6 +85,12 @@ public:
   std::mutex pedsMutex;
   std::unordered_map<std::string, arena_people_msgs::msg::Pedestrian> pedState;
   std::unordered_map<std::string, uint64_t> pedSeq;
+
+  // Last ped-name set seen on each topic. arena_peds carries the full active set
+  // per message, so a name that was present and is now absent has been ejected.
+  std::unordered_map<std::string, std::unordered_set<std::string>> topicPeds;
+  // Ejected ped names awaiting actor removal, drained each PreUpdate.
+  std::unordered_set<std::string> pendingRemovals;
 
   std::unordered_map<std::string, std::chrono::steady_clock::duration> animTime;
 
@@ -123,14 +135,30 @@ public:
     subscriptions[topic] =
       rosNode->create_subscription<arena_people_msgs::msg::Pedestrians>(
         topic, rclcpp::QoS(10),
-        [this](arena_people_msgs::msg::Pedestrians::SharedPtr msg)
+        [this, topic](arena_people_msgs::msg::Pedestrians::SharedPtr msg)
         {
           std::lock_guard<std::mutex> lock(pedsMutex);
+          std::unordered_set<std::string> names;
           for (const auto & ped : msg->pedestrians)
           {
+            names.insert(ped.name);
             pedState[ped.name] = ped;
             ++pedSeq[ped.name];
+            pendingRemovals.erase(ped.name);  // reappeared before removal ran
           }
+          // Names present last message but gone now are ejected: drop their
+          // state and queue the actor for removal.
+          auto & prev = topicPeds[topic];
+          for (const auto & name : prev)
+          {
+            if (!names.count(name))
+            {
+              pedState.erase(name);
+              pedSeq.erase(name);
+              pendingRemovals.insert(name);
+            }
+          }
+          prev = std::move(names);
         });
   }
 
@@ -190,27 +218,34 @@ void PedSkeletonPlugin::PreUpdate(
 
   std::unordered_map<std::string, arena_people_msgs::msg::Pedestrian> snapshot;
   std::unordered_map<std::string, uint64_t> seqSnapshot;
+  std::unordered_set<std::string> removals;
   {
     std::lock_guard<std::mutex> lock(dataPtr->pedsMutex);
     snapshot = dataPtr->pedState;
     seqSnapshot = dataPtr->pedSeq;
+    removals.swap(dataPtr->pendingRemovals);  // take and clear, one-shot
   }
-  if (snapshot.empty())
+  if (snapshot.empty() && removals.empty())
     return;
 
   const double dt = std::chrono::duration<double>(_info.dt).count();
   const double simTimeSec = std::chrono::duration<double>(_info.simTime).count();
 
+  std::vector<gz::sim::Entity> toRemove;
   _ecm.Each<gz::sim::components::Actor, gz::sim::components::Name>(
     [&](const gz::sim::Entity & entity,
         const gz::sim::components::Actor *,
         const gz::sim::components::Name * name) -> bool
     {
-      auto it = snapshot.find(name->Data());
-      if (it == snapshot.end())
-        return true;
-      const auto & ped = it->second;
       const std::string & pedName = name->Data();
+      auto it = snapshot.find(pedName);
+      if (it == snapshot.end())
+      {
+        if (removals.count(pedName))
+          toRemove.push_back(entity);
+        return true;
+      }
+      const auto & ped = it->second;
 
       const uint64_t seq = seqSnapshot[pedName];
       if (dataPtr->anchorSeq[pedName] != seq)
@@ -232,29 +267,42 @@ void PedSkeletonPlugin::PreUpdate(
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 
-      SetComponent<gz::sim::components::AnimationName>(
-        _ecm, entity, std::string(kAnimName));
-
+      // Idle peds stand (real-time stand clip); moving peds walk with the clip
+      // phased to ground speed so the feet stay planted.
       const double speed = std::hypot(ped.twist.linear.x, ped.twist.linear.y);
       auto & cursor = dataPtr->animTime[pedName];
+      double advance;
       if (speed > kIdleSpeed)
       {
-        const double advance = dt * (speed / kWalkRefSpeed);
-        cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::duration<double>(advance));
+        SetComponent<gz::sim::components::AnimationName>(
+          _ecm, entity, std::string(kWalkAnimName));
+        advance = dt * (speed / kWalkRefSpeed);
       }
+      else
+      {
+        SetComponent<gz::sim::components::AnimationName>(
+          _ecm, entity, std::string(kIdleAnimName));
+        advance = dt;
+      }
+      cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(advance));
       SetComponent<gz::sim::components::AnimationTime>(_ecm, entity, cursor);
       return true;
     });
 
-  // Drop cursors for peds that despawned.
-  for (auto it = dataPtr->animTime.begin(); it != dataPtr->animTime.end(); )
+  // Remove ejected pedestrians' actors.
+  for (const auto & entity : toRemove)
+    _ecm.RequestRemoveEntity(entity);
+
+  // Drop per-ped state for peds that despawned (pruned from the snapshot).
+  const auto dropStale = [&](auto & map)
   {
-    if (snapshot.count(it->first) == 0)
-      it = dataPtr->animTime.erase(it);
-    else
-      ++it;
-  }
+    for (auto it = map.begin(); it != map.end(); )
+      it = (snapshot.count(it->first) == 0) ? map.erase(it) : std::next(it);
+  };
+  dropStale(dataPtr->animTime);
+  dropStale(dataPtr->anchorSeq);
+  dropStale(dataPtr->anchorTime);
 }
 
 }  // namespace arena_gz_plugins

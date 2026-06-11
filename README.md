@@ -21,11 +21,17 @@ for every actor whose `Name` matches a `Pedestrian.name`:
    `arena_peds` samples the position is dead-reckoned by the ped's twist (re-anchored
    on each fresh sample, clamped to `kMaxExtrap`) so the body slides smoothly instead
    of stepping.
-2. **Animation** — sets `components::AnimationName` to the `walk` clip and advances
-   `components::AnimationTime` by `speed / kWalkRefSpeed` per second, where
-   `kWalkRefSpeed` is walk.dae's natural stride speed (1.384 m over its 5.79 s clip
-   = 0.239 m/s). That keeps the feet planted at the ped's ground speed. Below
-   `kIdleSpeed` the clip is held still.
+2. **Animation** — when moving, sets `components::AnimationName` to the `walk` clip
+   and advances `components::AnimationTime` by `speed / kWalkRefSpeed` per second,
+   where `kWalkRefSpeed` is walk.dae's natural stride speed (1.384 m over its 5.79 s
+   clip = 0.239 m/s), keeping the feet planted at the ped's ground speed. Below
+   `kIdleSpeed` it switches to the stationary `idle` (stand.dae) clip, advanced in
+   real time, so the body stands with light motion instead of a frozen walk frame.
+
+`arena_peds` carries the full active ped set per message, so a name that was present
+and is now absent has been **ejected**: the plugin drops its state and removes the
+actor entity (`RequestRemoveEntity`), so despawn is driven entirely by topic absence
+(no `set_pose`/delete from the runtime needed).
 
 Both components flow through gz's `RenderUtil` to the GUI **and** `gpu_lidar`.
 
@@ -60,5 +66,6 @@ When enabled, `arena_bringup/launch/simulator/sim/gazebo/gazebo.launch.py` injec
 ### Actor asset
 
 The pedestrian is `arena_simulation_setup/assets/Common/Pedestrian/arenian/arenian.sdf`:
-an `<actor>` with the walk.dae `<skin>` and a `<animation name="walk">` clip. The
-`walk` name is the contract the plugin passes to `AnimationName`.
+an `<actor>` with the walk.dae `<skin>` and `<animation name="walk">` /
+`<animation name="idle">` (stand.dae) clips. The `walk` and `idle` names are the
+contract the plugin passes to `AnimationName`.
