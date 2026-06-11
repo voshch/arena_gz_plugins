@@ -10,6 +10,9 @@ set(GZ_SIM_VER ${gz-sim8_VERSION_MAJOR})
 # gz-math 7 (Pose3d / Quaterniond)
 find_package(gz-math7 REQUIRED)
 
+# sdformat 14 (sdf::Root / sdf::Actor, for runtime actor creation)
+find_package(sdformat14 REQUIRED)
+
 # ROS 2
 find_package(rclcpp REQUIRED)
 find_package(arena_people_msgs REQUIRED)
@@ -24,6 +27,7 @@ target_include_directories(PedSkeletonPlugin PUBLIC
 target_link_libraries(PedSkeletonPlugin PUBLIC
   gz-sim${GZ_SIM_VER}::gz-sim${GZ_SIM_VER}
   gz-math7::gz-math7
+  sdformat14::sdformat14
   rclcpp::rclcpp
   ${arena_people_msgs_TARGETS}
 )

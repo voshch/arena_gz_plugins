@@ -22,12 +22,20 @@
 #include <gz/math/Quaternion.hh>
 #include <gz/math/Vector3.hh>
 
+#include <filesystem>
+#include <system_error>
+
 #include <gz/sim/Entity.hh>
 #include <gz/sim/EntityComponentManager.hh>
+#include <gz/sim/EventManager.hh>
+#include <gz/sim/SdfEntityCreator.hh>
 #include <gz/sim/System.hh>
 #include <gz/sim/components/Actor.hh>
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/Pose.hh>
+
+#include <sdf/Actor.hh>
+#include <sdf/Root.hh>
 
 #include <gz/plugin/Register.hh>
 
@@ -97,6 +105,16 @@ public:
   std::unordered_map<std::string, uint64_t> anchorSeq;
   std::unordered_map<std::string, double> anchorTime;
 
+  // name -> resolved actor SDF path, carried once on arena_peds (model_uri).
+  std::unordered_map<std::string, std::string> pedModelPath;
+  // SDF path -> parsed actor template, cached to avoid re-parsing on the sim thread.
+  std::unordered_map<std::string, sdf::Actor> actorTemplates;
+  // SDF paths that failed to load, warned once and skipped thereafter.
+  std::unordered_set<std::string> failedPaths;
+  // World entity new actors parent to, and the manager used to create them.
+  gz::sim::Entity worldEntity{gz::sim::kNullEntity};
+  gz::sim::EventManager * eventMgr{nullptr};
+
   // ROS spin thread, keeps rclcpp work off the sim thread.
   std::thread spinThread;
   std::atomic<bool> stopSpin{false};
@@ -145,6 +163,8 @@ public:
             pedState[ped.name] = ped;
             ++pedSeq[ped.name];
             pendingRemovals.erase(ped.name);  // reappeared before removal ran
+            if (!ped.model_uri.empty())
+              pedModelPath[ped.name] = ped.model_uri;
           }
           // Names present last message but gone now are ejected: drop their
           // state and queue the actor for removal.
@@ -155,6 +175,7 @@ public:
             {
               pedState.erase(name);
               pedSeq.erase(name);
+              pedModelPath.erase(name);
               pendingRemovals.insert(name);
             }
           }
@@ -175,6 +196,50 @@ public:
         SubscribeTopic(topic);
     }
   }
+
+  /// Lazily load + cache the actor template at an SDF path (file, or a model dir
+  /// holding <dir>.sdf or a single *.sdf). nullptr (warned once) if none loads.
+  const sdf::Actor * ActorTemplate(const std::string & path)
+  {
+    auto cached = actorTemplates.find(path);
+    if (cached != actorTemplates.end())
+      return &cached->second;
+    if (failedPaths.count(path))
+      return nullptr;
+
+    std::error_code ec;
+    std::string file = path;
+    if (std::filesystem::is_directory(file, ec))
+    {
+      const std::filesystem::path dir(file);
+      const std::filesystem::path named = dir / (dir.filename().string() + ".sdf");
+      if (std::filesystem::exists(named, ec))
+      {
+        file = named.string();
+      }
+      else
+      {
+        file.clear();
+        for (const auto & entry : std::filesystem::directory_iterator(dir, ec))
+        {
+          if (entry.path().extension() == ".sdf")
+          {
+            file = entry.path().string();
+            break;
+          }
+        }
+      }
+    }
+
+    sdf::Root root;
+    if (file.empty() || !root.Load(file).empty() || root.Actor() == nullptr)
+    {
+      gzerr << "[PedSkeletonPlugin] no loadable actor at '" << path << "'\n";
+      failedPaths.insert(path);
+      return nullptr;
+    }
+    return &actorTemplates.emplace(path, *root.Actor()).first->second;
+  }
 };
 
 PedSkeletonPlugin::PedSkeletonPlugin()
@@ -185,10 +250,10 @@ PedSkeletonPlugin::PedSkeletonPlugin()
 PedSkeletonPlugin::~PedSkeletonPlugin() = default;
 
 void PedSkeletonPlugin::Configure(
-  const gz::sim::Entity & /*_entity*/,
+  const gz::sim::Entity & _entity,
   const std::shared_ptr<const sdf::Element> & _sdf,
   gz::sim::EntityComponentManager & /*_ecm*/,
-  gz::sim::EventManager & /*_eventMgr*/)
+  gz::sim::EventManager & _eventMgr)
 {
   if (_sdf->HasElement("enabled"))
     dataPtr->enabled = _sdf->Get<bool>("enabled");
@@ -198,6 +263,10 @@ void PedSkeletonPlugin::Configure(
     gzmsg << "[PedSkeletonPlugin] disabled via SDF.\n";
     return;
   }
+
+  // The plugin attaches to the world, so its entity is the actors' parent.
+  dataPtr->worldEntity = _entity;
+  dataPtr->eventMgr = &_eventMgr;
 
   if (!rclcpp::ok())
     rclcpp::init(0, nullptr);
@@ -218,11 +287,13 @@ void PedSkeletonPlugin::PreUpdate(
 
   std::unordered_map<std::string, arena_people_msgs::msg::Pedestrian> snapshot;
   std::unordered_map<std::string, uint64_t> seqSnapshot;
+  std::unordered_map<std::string, std::string> modelPaths;
   std::unordered_set<std::string> removals;
   {
     std::lock_guard<std::mutex> lock(dataPtr->pedsMutex);
     snapshot = dataPtr->pedState;
     seqSnapshot = dataPtr->pedSeq;
+    modelPaths = dataPtr->pedModelPath;
     removals.swap(dataPtr->pendingRemovals);  // take and clear, one-shot
   }
   if (snapshot.empty() && removals.empty())
@@ -232,12 +303,14 @@ void PedSkeletonPlugin::PreUpdate(
   const double simTimeSec = std::chrono::duration<double>(_info.simTime).count();
 
   std::vector<gz::sim::Entity> toRemove;
+  std::unordered_set<std::string> liveActors;
   _ecm.Each<gz::sim::components::Actor, gz::sim::components::Name>(
     [&](const gz::sim::Entity & entity,
         const gz::sim::components::Actor *,
         const gz::sim::components::Name * name) -> bool
     {
       const std::string & pedName = name->Data();
+      liveActors.insert(pedName);
       auto it = snapshot.find(pedName);
       if (it == snapshot.end())
       {
@@ -293,6 +366,42 @@ void PedSkeletonPlugin::PreUpdate(
   // Remove ejected pedestrians' actors.
   for (const auto & entity : toRemove)
     _ecm.RequestRemoveEntity(entity);
+
+  // Spawn an actor for any ped with no live actor yet (idempotent on the ECM).
+  if (dataPtr->eventMgr != nullptr)
+  {
+    gz::sim::SdfEntityCreator creator(_ecm, *dataPtr->eventMgr);
+    for (const auto & [pedName, ped] : snapshot)
+    {
+      if (liveActors.count(pedName))
+        continue;
+      auto pathIt = modelPaths.find(pedName);
+      if (pathIt == modelPaths.end() || pathIt->second.empty())
+        continue;
+      const sdf::Actor * tmpl = dataPtr->ActorTemplate(pathIt->second);
+      if (tmpl == nullptr)
+        continue;
+
+      sdf::Actor actor = *tmpl;
+      actor.SetName(pedName);
+      const gz::sim::Entity entity = creator.CreateEntities(&actor);
+      creator.SetParent(entity, dataPtr->worldEntity);
+
+      // Place immediately so the actor does not flash at the origin before the
+      // drive pass picks it up next tick.
+      const gz::math::Pose3d worldPose(
+        gz::math::Vector3d(
+          ped.pose.position.x,
+          ped.pose.position.y,
+          ped.pose.position.z + kZOffset),
+        gz::math::Quaterniond(
+          ped.pose.orientation.w, ped.pose.orientation.x,
+          ped.pose.orientation.y, ped.pose.orientation.z));
+      SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
+      SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
+      gzmsg << "[PedSkeletonPlugin] spawned actor '" << pedName << "'\n";
+    }
+  }
 
   // Drop per-ped state for peds that despawned (pruned from the snapshot).
   const auto dropStale = [&](auto & map)
