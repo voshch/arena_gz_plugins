@@ -3,7 +3,7 @@
 <package format="3">
   <name>arena_gz_plugins</name>
   <version>0.1.0</version>
-  <description>Gazebo gz-sim 8 plugins for Arena: drives actor pedestrians (pose + walk clip) from arena_peds.</description>
+  <description>Gazebo gz-sim 8 plugins for Arena: drives actor pedestrians (pose + walk clip) from arena_peds, and exposes the GUI viewport camera over ROS 2.</description>
   <maintainer email="voshch@arena-rosnav.org">Arena-Rosnav</maintainer>
   <license>MIT</license>
 
@@ -13,9 +13,17 @@
   <depend>gz-sim8</depend>
   <!-- gz-math 7 (Pose3d / Quaterniond) -->
   <depend>gz-math7</depend>
+  <!-- gz-gui 8 / gz-rendering 8 / Qt 5 (ViewportCamera GUI plugin) -->
+  <depend>gz-gui8</depend>
+  <depend>gz-rendering8</depend>
+  <depend>qtbase5-dev</depend>
 
   <depend>rclcpp</depend>
   <depend>arena_people_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>arena_runtime_msgs</depend>
 
   <export>
     <build_type>ament_cmake</build_type>
