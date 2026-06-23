@@ -47,11 +47,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/image.hpp>
-#include <arena_runtime_msgs/msg/viewport_view.hpp>
-#include <arena_runtime_msgs/srv/viewport_capture.hpp>
-#include <arena_runtime_msgs/srv/viewport_set_projection.hpp>
-#include <arena_runtime_msgs/srv/viewport_set_reference_frame.hpp>
-#include <arena_runtime_msgs/srv/viewport_set_view.hpp>
+#include <viewport_control_msgs/msg/viewport_view.hpp>
+#include <viewport_control_msgs/srv/viewport_capture.hpp>
+#include <viewport_control_msgs/srv/viewport_set_projection.hpp>
+#include <viewport_control_msgs/srv/viewport_set_reference_frame.hpp>
+#include <viewport_control_msgs/srv/viewport_set_view.hpp>
 
 #include "arena_gz_plugins/ViewportCamera.hh"
 
@@ -60,11 +60,11 @@ namespace arena_gz_plugins
 
 using namespace std::chrono_literals;
 
-using SetView = arena_runtime_msgs::srv::ViewportSetView;
-using SetReferenceFrame = arena_runtime_msgs::srv::ViewportSetReferenceFrame;
-using SetProjection = arena_runtime_msgs::srv::ViewportSetProjection;
-using Capture = arena_runtime_msgs::srv::ViewportCapture;
-using ViewportView = arena_runtime_msgs::msg::ViewportView;
+using SetView = viewport_control_msgs::srv::ViewportSetView;
+using SetReferenceFrame = viewport_control_msgs::srv::ViewportSetReferenceFrame;
+using SetProjection = viewport_control_msgs::srv::ViewportSetProjection;
+using Capture = viewport_control_msgs::srv::ViewportCapture;
+using ViewportView = viewport_control_msgs::msg::ViewportView;
 
 namespace
 {

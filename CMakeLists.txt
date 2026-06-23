@@ -24,7 +24,7 @@ find_package(arena_people_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
-find_package(arena_runtime_msgs REQUIRED)
+find_package(viewport_control_msgs REQUIRED)
 
 add_library(PedSkeletonPlugin SHARED
   src/PedSkeletonPlugin.cc
@@ -70,7 +70,7 @@ target_link_libraries(ViewportCamera PUBLIC
   ${geometry_msgs_TARGETS}
   ${sensor_msgs_TARGETS}
   ${builtin_interfaces_TARGETS}
-  ${arena_runtime_msgs_TARGETS}
+  ${viewport_control_msgs_TARGETS}
 )
 install(TARGETS ViewportCamera
   LIBRARY DESTINATION lib
