@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <gz/math/Pose3.hh>
@@ -34,6 +35,7 @@
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/Pose.hh>
 
+#include <sdf/Element.hh>
 #include <sdf/Actor.hh>
 #include <sdf/Root.hh>
 
@@ -49,8 +51,8 @@ namespace arena_gz_plugins
 
 using namespace std::chrono_literals;
 
-// walk.dae zeroes its root under followTrajectory, dropping the ~1.01 m hips onto
-// the actor origin, so lift the origin to plant the feet at the ped ground z.
+// Fallback lift when no actor template is known yet (per-model lift otherwise
+// comes from actorZOffsets, read off the template's <pose> z).
 static constexpr double kZOffset = 1.01;
 // Clip played while moving, must match <animation name="..."> in the actor SDF.
 static constexpr const char * kWalkAnimName = "walk";
@@ -107,8 +109,19 @@ public:
 
   // name -> resolved actor SDF path, carried once on arena_peds (model_uri).
   std::unordered_map<std::string, std::string> pedModelPath;
+  // name -> model path the live actor was spawned with, so a later model change
+  // on the same ped name forces a despawn/respawn instead of being ignored.
+  std::unordered_map<std::string, std::string> spawnedModelPath;
   // SDF path -> parsed actor template, cached to avoid re-parsing on the sim thread.
   std::unordered_map<std::string, sdf::Actor> actorTemplates;
+  // SDF path -> actor origin lift (the template's <pose> z), ground-to-origin
+  // distance for this model. arenian needs 1.01, feet-at-origin bundles need 0.
+  std::unordered_map<std::string, double> actorZOffsets;
+  // SDF path -> {SDF clip name -> the name gz assigns the Ogre skeleton animation}.
+  // gz names DAE clips by their SDF <animation name>, but BVH clips by their
+  // resolved file path, so AnimationName must carry the latter for BVH actors.
+  std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+    actorAnimNames;
   // SDF paths that failed to load, warned once and skipped thereafter.
   std::unordered_set<std::string> failedPaths;
   // World entity new actors parent to, and the manager used to create them.
@@ -238,7 +251,57 @@ public:
       failedPaths.insert(path);
       return nullptr;
     }
-    return &actorTemplates.emplace(path, *root.Actor()).first->second;
+
+    // Absolutize skin/clip paths against the SDF's directory.
+    const std::filesystem::path baseDir = std::filesystem::path(file).parent_path();
+    const auto absolutize = [&baseDir](const std::string & uri)
+    {
+      if (uri.empty() || uri.find("://") != std::string::npos ||
+          std::filesystem::path(uri).is_absolute())
+        return uri;
+      return (baseDir / uri).lexically_normal().string();
+    };
+    const sdf::ElementPtr elem = root.Actor()->Element();
+    if (elem->HasElement("skin"))
+    {
+      const sdf::ElementPtr skin = elem->GetElement("skin");
+      skin->GetElement("filename")->Set(absolutize(skin->Get<std::string>("filename")));
+    }
+    sdf::ElementPtr animation =
+      elem->HasElement("animation") ? elem->GetElement("animation") : nullptr;
+    for (; animation; animation = animation->GetNextElement("animation"))
+      animation->GetElement("filename")->Set(absolutize(animation->Get<std::string>("filename")));
+
+    sdf::Actor actor;
+    actor.Load(elem);
+
+    auto & nameMap = actorAnimNames[path];
+    for (uint64_t i = 0; i < actor.AnimationCount(); ++i)
+    {
+      const sdf::Animation * anim = actor.AnimationByIndex(i);
+      std::string ext = std::filesystem::path(anim->Filename()).extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+      nameMap[anim->Name()] = (ext == ".bvh") ? anim->Filename() : anim->Name();
+    }
+
+    actorZOffsets[path] = actor.RawPose().Pos().Z();
+    return &actorTemplates.emplace(path, std::move(actor)).first->second;
+  }
+
+  /// Map a logical clip name (kWalkAnimName/kIdleAnimName) to the name gz gives
+  /// its Ogre skeleton animation for this model, falling back to the logical name
+  /// for DAE actors (e.g. arenian) whose names already match.
+  std::string ResolveAnimName(
+    const std::string & modelPath, const std::string & logical)
+  {
+    auto it = actorAnimNames.find(modelPath);
+    if (it != actorAnimNames.end())
+    {
+      auto jt = it->second.find(logical);
+      if (jt != it->second.end())
+        return jt->second;
+    }
+    return logical;
   }
 };
 
@@ -320,6 +383,20 @@ void PedSkeletonPlugin::PreUpdate(
       }
       const auto & ped = it->second;
 
+      // A ped whose model changed under the same name: tear the stale actor down
+      // so the spawn pass recreates it with the new model next tick.
+      const auto mpIt = modelPaths.find(pedName);
+      const auto smpIt = dataPtr->spawnedModelPath.find(pedName);
+      if (mpIt != modelPaths.end() && !mpIt->second.empty() &&
+          smpIt != dataPtr->spawnedModelPath.end() && smpIt->second != mpIt->second)
+      {
+        gzmsg << "[PedSkeletonPlugin] model changed for '" << pedName
+              << "', respawning\n";
+        toRemove.push_back(entity);
+        dataPtr->spawnedModelPath.erase(smpIt);
+        return true;
+      }
+
       const uint64_t seq = seqSnapshot[pedName];
       if (dataPtr->anchorSeq[pedName] != seq)
       {
@@ -329,11 +406,19 @@ void PedSkeletonPlugin::PreUpdate(
       const double elapsed =
         std::clamp(simTimeSec - dataPtr->anchorTime[pedName], 0.0, kMaxExtrap);
 
+      double lift = kZOffset;
+      if (mpIt != modelPaths.end() && !mpIt->second.empty())
+      {
+        const auto zIt = dataPtr->actorZOffsets.find(mpIt->second);
+        if (zIt != dataPtr->actorZOffsets.end())
+          lift = zIt->second;
+      }
+
       gz::math::Pose3d worldPose(
         gz::math::Vector3d(
           ped.pose.position.x + ped.twist.linear.x * elapsed,
           ped.pose.position.y + ped.twist.linear.y * elapsed,
-          ped.pose.position.z + kZOffset),
+          ped.pose.position.z + lift),
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
@@ -344,17 +429,19 @@ void PedSkeletonPlugin::PreUpdate(
       // phased to ground speed so the feet stay planted.
       const double speed = std::hypot(ped.twist.linear.x, ped.twist.linear.y);
       auto & cursor = dataPtr->animTime[pedName];
+      const std::string modelPath =
+        (mpIt != modelPaths.end()) ? mpIt->second : std::string();
       double advance;
       if (speed > kIdleSpeed)
       {
         SetComponent<gz::sim::components::AnimationName>(
-          _ecm, entity, std::string(kWalkAnimName));
+          _ecm, entity, dataPtr->ResolveAnimName(modelPath, kWalkAnimName));
         advance = dt * (speed / kWalkRefSpeed);
       }
       else
       {
         SetComponent<gz::sim::components::AnimationName>(
-          _ecm, entity, std::string(kIdleAnimName));
+          _ecm, entity, dataPtr->ResolveAnimName(modelPath, kIdleAnimName));
         advance = dt;
       }
       cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -386,6 +473,7 @@ void PedSkeletonPlugin::PreUpdate(
       actor.SetName(pedName);
       const gz::sim::Entity entity = creator.CreateEntities(&actor);
       creator.SetParent(entity, dataPtr->worldEntity);
+      dataPtr->spawnedModelPath[pedName] = pathIt->second;
 
       // Place immediately so the actor does not flash at the origin before the
       // drive pass picks it up next tick.
@@ -393,7 +481,7 @@ void PedSkeletonPlugin::PreUpdate(
         gz::math::Vector3d(
           ped.pose.position.x,
           ped.pose.position.y,
-          ped.pose.position.z + kZOffset),
+          ped.pose.position.z + dataPtr->actorZOffsets[pathIt->second]),
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
@@ -412,6 +500,7 @@ void PedSkeletonPlugin::PreUpdate(
   dropStale(dataPtr->animTime);
   dropStale(dataPtr->anchorSeq);
   dropStale(dataPtr->anchorTime);
+  dropStale(dataPtr->spawnedModelPath);
 }
 
 }  // namespace arena_gz_plugins
