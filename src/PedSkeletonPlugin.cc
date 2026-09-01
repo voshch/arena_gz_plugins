@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -49,8 +50,10 @@ namespace arena_gz_plugins
 
 using namespace std::chrono_literals;
 
-// walk.dae zeroes its root under followTrajectory, dropping the ~1.01 m hips onto
-// the actor origin, so lift the origin to plant the feet at the ped ground z.
+// Fallback ground offset, used only when no actor template is cached yet.
+// Each model's real offset is read from its actor SDF's authored pose z
+// (walk.dae's followTrajectory zeroes its root, so arenian authors 1.01 m
+// there to plant the feet; this fallback matches that).
 static constexpr double kZOffset = 1.01;
 // Clip played while moving, must match <animation name="..."> in the actor SDF.
 static constexpr const char * kWalkAnimName = "walk";
@@ -64,6 +67,8 @@ static constexpr double kWalkRefSpeed = 0.239;
 static constexpr double kIdleSpeed = 0.05;
 // Max seconds to dead-reckon a stalled ped.
 static constexpr double kMaxExtrap = 0.5;
+// 2*pi, converts a gait phase in radians to a fraction of the walk clip.
+static constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
 
 /// Create-or-update a component and flag it for SceneBroadcaster propagation.
 template <typename ComponentT, typename ValueT>
@@ -79,6 +84,96 @@ static void SetComponent(
     comp->Data() = _value;
   _ecm.SetChanged(
     _entity, ComponentT::typeId, gz::sim::ComponentState::OneTimeChange);
+}
+
+/// Parsed actor template plus per-model metadata resolved once at load time.
+struct CachedActor
+{
+  sdf::Actor actor;
+  // Authored actor SDF pose z, the per-model ground offset (see kZOffset).
+  double groundZ{0.0};
+  // Walk-cycle duration in seconds, from the walk animation's BVH header. 0
+  // for non-BVH clips (e.g. arenian's walk.dae), which keep legacy dead
+  // reckoning instead of phase lock.
+  double walkClipSeconds{0.0};
+};
+
+/// Parse a BVH MOTION header for "Frames:" and "Frame Time:" and return their
+/// product, the clip duration in seconds. 0.0 if the file is missing or the
+/// header cannot be parsed.
+static double ParseBvhDuration(const std::string & path)
+{
+  std::ifstream file(path);
+  if (!file.is_open())
+    return 0.0;
+
+  std::string line;
+  bool inMotion = false;
+  long frames = -1;
+  double frameTime = -1.0;
+  while (std::getline(file, line))
+  {
+    if (!inMotion)
+    {
+      if (line.find("MOTION") != std::string::npos)
+        inMotion = true;
+      continue;
+    }
+    const auto framesPos = line.find("Frames:");
+    if (frames < 0 && framesPos != std::string::npos)
+    {
+      try
+      {
+        frames = std::stol(line.substr(framesPos + 7));
+      }
+      catch (const std::exception &)
+      {
+        return 0.0;
+      }
+    }
+    const auto timePos = line.find("Frame Time:");
+    if (frameTime < 0 && timePos != std::string::npos)
+    {
+      try
+      {
+        frameTime = std::stod(line.substr(timePos + 11));
+      }
+      catch (const std::exception &)
+      {
+        return 0.0;
+      }
+    }
+    if (frames >= 0 && frameTime >= 0)
+      break;
+  }
+  return (frames >= 0 && frameTime >= 0) ? static_cast<double>(frames) * frameTime : 0.0;
+}
+
+/// Resolve the "walk" animation's clip relative to the actor SDF's directory
+/// and, if it is a BVH, return its duration. 0.0 for non-BVH clips (walk.dae)
+/// or a missing walk animation.
+static double WalkClipDuration(const sdf::Actor & actor, const std::string & actorFile)
+{
+  const sdf::Animation * walkAnim = nullptr;
+  for (uint64_t i = 0; i < actor.AnimationCount(); ++i)
+  {
+    const sdf::Animation * anim = actor.AnimationByIndex(i);
+    if (anim != nullptr && anim->Name() == kWalkAnimName)
+    {
+      walkAnim = anim;
+      break;
+    }
+  }
+  if (walkAnim == nullptr)
+    return 0.0;
+
+  std::filesystem::path clipPath(walkAnim->Filename());
+  if (!clipPath.is_absolute())
+    clipPath = std::filesystem::path(actorFile).parent_path() / clipPath;
+  if (clipPath.extension() != ".bvh")
+    return 0.0;
+
+  return ParseBvhDuration(clipPath.string());
 }
 
 class PedSkeletonPluginPrivate
@@ -107,8 +202,13 @@ public:
 
   // name -> resolved actor SDF path, carried once on arena_peds (model_uri).
   std::unordered_map<std::string, std::string> pedModelPath;
-  // SDF path -> parsed actor template, cached to avoid re-parsing on the sim thread.
-  std::unordered_map<std::string, sdf::Actor> actorTemplates;
+  // name -> the SDF path the live actor was actually spawned from. Ped names
+  // repeat across episodes while their models change, so a mismatch against
+  // pedModelPath means the actor carries a stale skin and must be respawned.
+  std::unordered_map<std::string, std::string> actorModelPath;
+  // SDF path -> parsed actor template (+ ground offset, walk clip duration),
+  // cached to avoid re-parsing on the sim thread.
+  std::unordered_map<std::string, CachedActor> actorTemplates;
   // SDF paths that failed to load, warned once and skipped thereafter.
   std::unordered_set<std::string> failedPaths;
   // World entity new actors parent to, and the manager used to create them.
@@ -199,7 +299,7 @@ public:
 
   /// Lazily load + cache the actor template at an SDF path (file, or a model dir
   /// holding <dir>.sdf or a single *.sdf). nullptr (warned once) if none loads.
-  const sdf::Actor * ActorTemplate(const std::string & path)
+  const CachedActor * ActorTemplate(const std::string & path)
   {
     auto cached = actorTemplates.find(path);
     if (cached != actorTemplates.end())
@@ -238,7 +338,12 @@ public:
       failedPaths.insert(path);
       return nullptr;
     }
-    return &actorTemplates.emplace(path, *root.Actor()).first->second;
+
+    CachedActor entry;
+    entry.actor = *root.Actor();
+    entry.groundZ = entry.actor.RawPose().Pos().Z();
+    entry.walkClipSeconds = WalkClipDuration(entry.actor, file);
+    return &actorTemplates.emplace(path, std::move(entry)).first->second;
   }
 };
 
@@ -320,6 +425,22 @@ void PedSkeletonPlugin::PreUpdate(
       }
       const auto & ped = it->second;
 
+      const auto pathIt = modelPaths.find(pedName);
+      // Ped names repeat across episodes while their models change, so an
+      // actor spawned from a different SDF than the ped's current one carries
+      // a stale skin: remove it and let the spawn pass recreate it next tick.
+      if (pathIt != modelPaths.end() && !pathIt->second.empty())
+      {
+        const auto spawnedIt = dataPtr->actorModelPath.find(pedName);
+        if (spawnedIt == dataPtr->actorModelPath.end() ||
+            spawnedIt->second != pathIt->second)
+        {
+          dataPtr->actorModelPath.erase(pedName);
+          toRemove.push_back(entity);
+          return true;
+        }
+      }
+
       const uint64_t seq = seqSnapshot[pedName];
       if (dataPtr->anchorSeq[pedName] != seq)
       {
@@ -329,11 +450,15 @@ void PedSkeletonPlugin::PreUpdate(
       const double elapsed =
         std::clamp(simTimeSec - dataPtr->anchorTime[pedName], 0.0, kMaxExtrap);
 
+      const CachedActor * tmpl = (pathIt != modelPaths.end())
+        ? dataPtr->ActorTemplate(pathIt->second) : nullptr;
+      const double groundZ = (tmpl != nullptr) ? tmpl->groundZ : kZOffset;
+
       gz::math::Pose3d worldPose(
         gz::math::Vector3d(
           ped.pose.position.x + ped.twist.linear.x * elapsed,
           ped.pose.position.y + ped.twist.linear.y * elapsed,
-          ped.pose.position.z + kZOffset),
+          ped.pose.position.z + groundZ),
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
@@ -344,21 +469,34 @@ void PedSkeletonPlugin::PreUpdate(
       // phased to ground speed so the feet stay planted.
       const double speed = std::hypot(ped.twist.linear.x, ped.twist.linear.y);
       auto & cursor = dataPtr->animTime[pedName];
-      double advance;
       if (speed > kIdleSpeed)
       {
         SetComponent<gz::sim::components::AnimationName>(
           _ecm, entity, std::string(kWalkAnimName));
-        advance = dt * (speed / kWalkRefSpeed);
+        if (ped.gait_phase > 0.0f && tmpl != nullptr && tmpl->walkClipSeconds > 0.0)
+        {
+          // Absolute phase lock to the ROS-side gait: this formula must match
+          // GaitGenerator's cadence in gait.py (_gait_walk/_gait_run).
+          const double phaseRate = kTwoPi * std::clamp(0.4 + 0.55 * speed, 0.4, 2.2);
+          const double phaseSeconds =
+            (ped.gait_phase + phaseRate * elapsed) / kTwoPi * tmpl->walkClipSeconds;
+          cursor = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(phaseSeconds));
+        }
+        else
+        {
+          const double advance = dt * (speed / kWalkRefSpeed);
+          cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(advance));
+        }
       }
       else
       {
         SetComponent<gz::sim::components::AnimationName>(
           _ecm, entity, std::string(kIdleAnimName));
-        advance = dt;
+        cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double>(dt));
       }
-      cursor += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(advance));
       SetComponent<gz::sim::components::AnimationTime>(_ecm, entity, cursor);
       return true;
     });
@@ -378,14 +516,15 @@ void PedSkeletonPlugin::PreUpdate(
       auto pathIt = modelPaths.find(pedName);
       if (pathIt == modelPaths.end() || pathIt->second.empty())
         continue;
-      const sdf::Actor * tmpl = dataPtr->ActorTemplate(pathIt->second);
+      const CachedActor * tmpl = dataPtr->ActorTemplate(pathIt->second);
       if (tmpl == nullptr)
         continue;
 
-      sdf::Actor actor = *tmpl;
+      sdf::Actor actor = tmpl->actor;
       actor.SetName(pedName);
       const gz::sim::Entity entity = creator.CreateEntities(&actor);
       creator.SetParent(entity, dataPtr->worldEntity);
+      dataPtr->actorModelPath[pedName] = pathIt->second;
 
       // Place immediately so the actor does not flash at the origin before the
       // drive pass picks it up next tick.
@@ -393,7 +532,7 @@ void PedSkeletonPlugin::PreUpdate(
         gz::math::Vector3d(
           ped.pose.position.x,
           ped.pose.position.y,
-          ped.pose.position.z + kZOffset),
+          ped.pose.position.z + tmpl->groundZ),
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
@@ -412,6 +551,7 @@ void PedSkeletonPlugin::PreUpdate(
   dropStale(dataPtr->animTime);
   dropStale(dataPtr->anchorSeq);
   dropStale(dataPtr->anchorTime);
+  dropStale(dataPtr->actorModelPath);
 }
 
 }  // namespace arena_gz_plugins
