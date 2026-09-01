@@ -45,6 +45,7 @@
 #include <gz/sim/components/Name.hh>
 
 #include <rclcpp/rclcpp.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <viewport_control_msgs/msg/viewport_view.hpp>
@@ -115,6 +116,11 @@ gz::math::Pose3d ToPose(const geometry_msgs::msg::Pose & _p)
     gz::math::Vector3d(_p.position.x, _p.position.y, _p.position.z),
     gz::math::Quaterniond(
       _p.orientation.w, _p.orientation.x, _p.orientation.y, _p.orientation.z));
+}
+
+std::chrono::steady_clock::duration ToDuration(const builtin_interfaces::msg::Time & _t)
+{
+  return std::chrono::seconds(_t.sec) + std::chrono::nanoseconds(_t.nanosec);
 }
 
 // True if pose _a differs meaningfully from _b, used to spot a manual camera grab.
@@ -242,6 +248,9 @@ public:
   uint8_t refMode{SetReferenceFrame::Request::FULL};
   std::optional<gz::math::Pose3d> refTargetPose;  // entity world pose, sampled in Update
 
+  // Latest UpdateInfo.simTime, sampled every Update. Gates capture on min_sim_time.
+  std::chrono::steady_clock::duration latestSimTime{0};
+
   // Capture handshake: the service fills the request and waits on captureCv for
   // the render thread to render the pose and hand back the pixels.
   std::condition_variable captureCv;
@@ -250,6 +259,7 @@ public:
   gz::math::Pose3d captureLocal;       // local pose to snap to for the grab
   bool captureWorldOrientation{false};
   double captureFov{0.0};
+  std::chrono::steady_clock::duration captureMinSimTime{0};  // defer until latestSimTime reaches this
   bool captureOk{false};
   std::string captureMsg;
   sensor_msgs::msg::Image captureImage;
@@ -395,17 +405,20 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
       this->dataPtr->captureLocal = ToPose(_req->pose);
       this->dataPtr->captureWorldOrientation = _req->world_orientation;
       this->dataPtr->captureFov = _req->fov;
+      this->dataPtr->captureMinSimTime = ToDuration(_req->min_sim_time);
       this->dataPtr->captureDone = false;
       this->dataPtr->captureRequested = true;
       // Block this service call until the render thread renders the pose and
-      // fills the pixels (or give up if the GUI never renders).
+      // fills the pixels (or give up if the GUI never renders). Longer than the
+      // 5s render-only wait to also cover a step + state-propagation delay when
+      // min_sim_time holds the capture back.
       const bool ready = this->dataPtr->captureCv.wait_for(
-        lock, 5s, [this] { return this->dataPtr->captureDone; });
+        lock, 15s, [this] { return this->dataPtr->captureDone; });
       if (!ready)
       {
         this->dataPtr->captureRequested = false;
         _res->success = false;
-        _res->message = "capture timed out (is the GUI rendering?)";
+        _res->message = "capture timed out (is the GUI rendering, or is min_sim_time not yet reached?)";
         return;
       }
       _res->success = this->dataPtr->captureOk;
@@ -422,11 +435,12 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
 }
 
 void ViewportCamera::Update(
-  const gz::sim::UpdateInfo &, gz::sim::EntityComponentManager & _ecm)
+  const gz::sim::UpdateInfo & _info, gz::sim::EntityComponentManager & _ecm)
 {
   std::string entity;
   {
     std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
+    this->dataPtr->latestSimTime = _info.simTime;
     entity = this->dataPtr->refEntity;
   }
   if (entity.empty())
@@ -615,6 +629,10 @@ void ViewportCamera::MaybeCapture()
   {
     std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
     if (!this->dataPtr->captureRequested)
+      return;
+    // Defer while the scene hasn't caught up to the requested sim time yet; the
+    // request stays pending and a later render (after state propagation) retries.
+    if (this->dataPtr->latestSimTime < this->dataPtr->captureMinSimTime)
       return;
     local = this->dataPtr->captureLocal;
     worldOrientation = this->dataPtr->captureWorldOrientation;

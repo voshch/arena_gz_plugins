@@ -20,6 +20,8 @@ class ViewportCameraPrivate;
 /// publishes the live camera pose on /arena/viewport/camera_pose (PoseStamped).
 /// The capture service (ViewportCapture) snaps to an exact pose, renders, and
 /// returns the frame, so an external recorder can dump a deterministic sequence.
+/// A request may set min_sim_time to defer the render until the scene has caught
+/// up to that sim time (tracked from UpdateInfo.simTime each Update).
 ///
 /// The camera pose is composed every render frame as reference * local: the
 /// reference is the world origin, a constant pose, or a tracked entity (sampled
