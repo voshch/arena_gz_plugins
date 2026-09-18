@@ -89,18 +89,18 @@ regardless of how many envs are attached):
 | `set_reference_frame` | `arena_runtime_msgs/srv/ViewportSetReferenceFrame` | call | sets the frame that `set_view` and `cmd_view` poses are expressed in. |
 | `cmd_view` | `arena_runtime_msgs/msg/ViewportView` | subscribe | keyframe stream; plugin buffers and interpolates by time each render frame. QoS: best-effort, keep-last-64. |
 | `set_projection` | `arena_runtime_msgs/srv/ViewportSetProjection` | call | `"perspective"` or `"orthographic"`. |
-| `capture` | `arena_runtime_msgs/srv/ViewportCapture` | call | snap to an exact pose, render, and return the frame (`rgb8`). The deterministic-recording primitive: it composes the world pose (`reference * local`, the same composition as the live drive), renders that frame on the render thread, reads the pixels back, and returns them. Synced to the render thread via a condition variable, the call blocks (up to 5 s) until the render thread renders the pose and hands back the pixels. Request also carries `world_orientation` (true keeps the aim world-stable) and `fov` (rad, `<= 0` keeps the current value). |
+| `capture` | `arena_runtime_msgs/srv/ViewportCapture` | call | snap to an exact pose, render, and return the frame (`rgb8`). The deterministic-recording primitive: it composes the world pose (`reference * local`, the same composition as the live drive), renders that frame on the render thread, reads the pixels back, and returns them. Synced to the render thread via a condition variable, the call blocks (up to 15 s) until the render thread renders the pose and hands back the pixels. Request also carries `world_orientation` (true keeps the aim world-stable), `fov` (rad, `<= 0` keeps the current value) and `min_sim_time`: a non-zero value defers the grab until the GUI's sim time reaches it (up to 15 s). Such a gated capture then pulls one full state from the server (`/world/<name>/state_async`) and hands it to the GUI before grabbing, because the scene broadcaster throttles pose updates on wall time and a stepped sim's single iteration is rarely published, which left the rendered scene several frames stale. |
 | `camera_pose` | `geometry_msgs/msg/PoseStamped` | publish | live camera pose, ~10 Hz, in the `map` frame. |
 
 **Pose composition.** Each render frame the camera world pose is `reference_frame * local_pose`. The reference frame is one of:
 - World origin (default, identity).
 - A constant pose (supplied via `set_reference_frame` with `has_pose: true` and `entity` empty).
-- A tracked scene entity: the plugin looks up the entity's live world pose from the ECM every frame (`entity` non-empty).
+- A tracked entity: every frame the plugin looks up the entity's live world pose, from the ECM by name, else from TF in `map` (`entity` non-empty).
 
 The local pose comes from `set_view` (one-shot) or the `cmd_view` stream (continuous).
 
 **`set_reference_frame` fields:**
-- `string entity`: sim_path to track (e.g. `env_0/jackal`). Empty selects a constant or latched frame.
+- `string entity`: what to track, a TF frame id (e.g. `env_0/jackal/base_link`, the same string every backend accepts) or a gz entity name (e.g. the model `env_0/jackal`). Empty selects a constant or latched frame.
 - `geometry_msgs/Pose pose`: constant reference pose, used when `entity` is empty and `has_pose` is true.
 - `bool has_pose`: see above.
 - `uint8 mode`: `FULL`=0 / `YAW_ONLY`=1 / `POSITION_ONLY`=2. Controls how much of a tracked entity's rotation the local offset inherits. Ignored when no entity is tracked.
@@ -118,7 +118,7 @@ The local pose comes from `set_view` (one-shot) or the `cmd_view` stream (contin
 
 Interpolation runs inside the render loop of each simulator's plugin (sampling the buffer at the exact render instant, next to the camera, no extra transport). The logic is sim-agnostic: the only irreducibly sim-specific surface is a thin **CameraBackend** (set/get camera world pose, set projection, set fov, resolve a named entity's world pose). Everything else (keyframe buffer + interpolation, reference-frame composition, drive model, grab-to-release, the ROS services/topics) belongs to a sim-agnostic **ViewportController**. A new sim = implement the ~5-method backend, not the controller. Current status: `ViewportCamera` holds this logic inline as the reference implementation with the interpolation core (`SampleBuffer` + `Keyframe`) already factored out; the full ViewportController/CameraBackend extraction is the next step. Honest caveat: gz plugins are C++ and Isaac is Python, so "shared" means two direct-mirror controllers (~80 lines each), not one binary.
 
-`entity` is the scoped model name (sim_path, e.g. `env_0/jackal`). Poses are in the world frame, which Arena pins to `map`.
+`entity` is resolved as a scene entity name first (sim_path, e.g. `env_0/jackal`) and as a TF frame otherwise (e.g. `env_0/jackal/base_link`). Poses are in the world frame, which Arena pins to `map`.
 
 The same surface is mirrored in-process by `ViewportITF` on `BaseSim`
 (`viewport_set_view` / `viewport_set_reference_frame` / `viewport_stream_view` /

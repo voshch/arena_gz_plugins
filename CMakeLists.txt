@@ -20,6 +20,7 @@ find_package(Qt5 REQUIRED COMPONENTS Core Quick)
 
 # ROS 2
 find_package(rclcpp REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(arena_people_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -67,6 +68,7 @@ target_link_libraries(ViewportCamera PUBLIC
   Qt5::Core
   Qt5::Quick
   rclcpp::rclcpp
+  tf2_ros::tf2_ros
   ${geometry_msgs_TARGETS}
   ${sensor_msgs_TARGETS}
   ${builtin_interfaces_TARGETS}

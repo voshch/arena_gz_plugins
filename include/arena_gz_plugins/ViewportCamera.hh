@@ -1,7 +1,10 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <string>
 
+#include <gz/math/Pose3.hh>
 #include <gz/sim/gui/GuiSystem.hh>
 
 namespace arena_gz_plugins
@@ -55,6 +58,9 @@ private:
   /// Fulfil a pending capture request: snap to the exact pose, render, read the
   /// pixels back, and wake the waiting service. No-op if none pending. Render thread.
   void MaybeCapture();
+
+  /// World pose of a TF frame in map, nullopt while the transform is unknown.
+  std::optional<gz::math::Pose3d> TfPose(const std::string & _frame) const;
 
   std::unique_ptr<ViewportCameraPrivate> dataPtr;
 };

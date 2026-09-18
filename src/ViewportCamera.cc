@@ -25,7 +25,12 @@
 
 #include <gz/gui/Application.hh>
 #include <gz/gui/GuiEvents.hh>
+#include <gz/gui/Helpers.hh>
 #include <gz/gui/MainWindow.hh>
+
+#include <gz/msgs/serialized_map.pb.h>
+#include <gz/msgs/stringmsg.pb.h>
+#include <gz/transport/Node.hh>
 
 #include <gz/math/Angle.hh>
 #include <gz/math/Pose3.hh>
@@ -45,6 +50,8 @@
 #include <gz/sim/components/Name.hh>
 
 #include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -72,6 +79,15 @@ namespace
 // Arena pins the gz world origin to map (static map->odom at the origin), so the
 // user-camera world pose is map-frame.
 constexpr const char * kPoseFrame = "map";
+
+// A gated capture asks the server for a full state once its sim time is reached and
+// grabs this many renders after the reply reached the GUI. The scene broadcaster
+// throttles pose updates on wall time, so a stepped sim's single iteration rarely
+// gets published and the scene would show poses several frames old.
+constexpr unsigned int kCaptureSettleRenders = 2;
+
+// GuiRunner's queued OnStateQt slot is declared with this spelling of the type.
+namespace msgs = gz::msgs;
 // Publish the camera pose every Nth render frame, ~10 Hz at 60 fps.
 constexpr unsigned int kPublishEveryNFrames = 6;
 // Release the camera to manual control this long after the last cmd_view. Larger
@@ -216,6 +232,49 @@ public:
       exec.spin_once(100ms);
   }
 
+  // GUI thread. Locate gz-sim's GuiRunner and open the service full states come back on.
+  void FindGuiRunner()
+  {
+    if (this->guiRunner)
+      return;
+    QObject * runner = nullptr;
+    for (QObject * child : gz::gui::App()->children())
+    {
+      if (std::string(child->metaObject()->className()).find("GuiRunner") != std::string::npos)
+        runner = child;
+    }
+    const QStringList worlds = gz::gui::worldNames();
+    if (!runner || worlds.empty())
+      return;
+    const std::string reply =
+      "/arena/viewport/" + std::to_string(gz::gui::App()->applicationPid()) + "/full_state";
+    if (!this->gzNode.Advertise(reply, &ViewportCameraPrivate::OnFullState, this))
+      return;
+    std::lock_guard<std::mutex> lock(this->mutex);
+    this->guiRunner = runner;
+    this->stateReplySrv = reply;
+    this->stateAsyncSrv = "/world/" + worlds[0].toStdString() + "/state_async";
+  }
+
+  // The server's full state for a gated capture: hand it to the GUI runner the way
+  // its own subscription would, then let the capture settle and grab.
+  void OnFullState(const gz::msgs::SerializedStepMap & _msg)
+  {
+    std::lock_guard<std::mutex> lock(this->mutex);
+    if (this->captureStage != CaptureStage::AwaitState || !this->guiRunner)
+      return;
+    const auto & stamp = _msg.stats().sim_time();
+    const auto simTime = std::chrono::seconds(stamp.sec()) + std::chrono::nanoseconds(stamp.nsec());
+    if (simTime < this->captureMinSimTime)
+    {
+      this->captureStage = CaptureStage::AwaitTime;  // step not applied yet, ask again
+      return;
+    }
+    QMetaObject::invokeMethod(
+      this->guiRunner, "OnStateQt", Qt::QueuedConnection, Q_ARG(msgs::SerializedStepMap, _msg));
+    this->captureStage = CaptureStage::Settle;
+  }
+
   // ROS, owned by the spin thread.
   rclcpp::Node::SharedPtr ros;
   rclcpp::Service<SetView>::SharedPtr setViewSrv;
@@ -224,6 +283,9 @@ public:
   rclcpp::Service<Capture>::SharedPtr captureSrv;
   rclcpp::Subscription<ViewportView>::SharedPtr viewSub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr posePub;
+  // A tracked name that is no ECM entity is looked up as a TF frame in map (= world).
+  std::shared_ptr<tf2_ros::Buffer> tfBuffer;
+  std::shared_ptr<tf2_ros::TransformListener> tfListener;
   std::thread spinThread;
   std::atomic<bool> stopSpin{false};
 
@@ -260,6 +322,13 @@ public:
   bool captureWorldOrientation{false};
   double captureFov{0.0};
   std::chrono::steady_clock::duration captureMinSimTime{0};  // defer until latestSimTime reaches this
+  enum class CaptureStage { AwaitTime, AwaitState, Settle };
+  CaptureStage captureStage{CaptureStage::AwaitTime};  // progress of a gated capture
+  unsigned int captureSettle{0};       // renders left once the full state reached the GUI
+  QObject * guiRunner{nullptr};        // gz-sim's GuiRunner, found in Update
+  gz::transport::Node gzNode;
+  std::string stateReplySrv;           // our one-way service the server sends full states to
+  std::string stateAsyncSrv;           // /world/<name>/state_async
   bool captureOk{false};
   std::string captureMsg;
   sensor_msgs::msg::Image captureImage;
@@ -406,6 +475,8 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
       this->dataPtr->captureWorldOrientation = _req->world_orientation;
       this->dataPtr->captureFov = _req->fov;
       this->dataPtr->captureMinSimTime = ToDuration(_req->min_sim_time);
+      this->dataPtr->captureStage = ViewportCameraPrivate::CaptureStage::AwaitTime;
+      this->dataPtr->captureSettle = kCaptureSettleRenders;
       this->dataPtr->captureDone = false;
       this->dataPtr->captureRequested = true;
       // Block this service call until the render thread renders the pose and
@@ -430,8 +501,30 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
     this->dataPtr->ros->create_publisher<geometry_msgs::msg::PoseStamped>(
       "/arena/viewport/camera_pose", rclcpp::QoS(10));
 
+  this->dataPtr->tfBuffer =
+    std::make_shared<tf2_ros::Buffer>(this->dataPtr->ros->get_clock());
+  this->dataPtr->tfListener = std::make_shared<tf2_ros::TransformListener>(
+    *this->dataPtr->tfBuffer, this->dataPtr->ros, false);
+
   this->dataPtr->spinThread =
     std::thread(&ViewportCameraPrivate::SpinLoop, this->dataPtr.get());
+}
+
+// World pose of a TF frame, nullopt while the transform is unknown.
+std::optional<gz::math::Pose3d> ViewportCamera::TfPose(const std::string & _frame) const
+{
+  geometry_msgs::msg::TransformStamped tf;
+  try
+  {
+    tf = this->dataPtr->tfBuffer->lookupTransform(kPoseFrame, _frame, tf2::TimePointZero);
+  }
+  catch (const tf2::TransformException &)
+  {
+    return std::nullopt;
+  }
+  const auto & t = tf.transform.translation;
+  const auto & q = tf.transform.rotation;
+  return gz::math::Pose3d(t.x, t.y, t.z, q.w, q.x, q.y, q.z);
 }
 
 void ViewportCamera::Update(
@@ -443,27 +536,34 @@ void ViewportCamera::Update(
     this->dataPtr->latestSimTime = _info.simTime;
     entity = this->dataPtr->refEntity;
   }
+  this->dataPtr->FindGuiRunner();
   if (entity.empty())
     return;
 
+  // A scene entity by name first, else a TF frame.
+  std::optional<gz::math::Pose3d> pose;
   const gz::sim::Entity e =
     _ecm.EntityByComponents(gz::sim::components::Name(entity));
-  if (e == gz::sim::kNullEntity)
+  if (e != gz::sim::kNullEntity)
+    pose = gz::sim::worldPose(e, _ecm);
+  else
+    pose = this->TfPose(entity);
+  if (!pose)
   {
     if (this->dataPtr->warnedEntity != entity)
     {
       this->dataPtr->warnedEntity = entity;
       RCLCPP_WARN(
         this->dataPtr->ros->get_logger(),
-        "tracked entity '%s' not found; camera holds the world frame", entity.c_str());
+        "tracked entity '%s' is neither a scene entity nor a TF frame; camera holds the world frame",
+        entity.c_str());
     }
     return;
   }
   this->dataPtr->warnedEntity.clear();
 
-  const gz::math::Pose3d pose = gz::sim::worldPose(e, _ecm);
   std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
-  this->dataPtr->refTargetPose = pose;
+  this->dataPtr->refTargetPose = *pose;
 }
 
 bool ViewportCamera::eventFilter(QObject * _obj, QEvent * _event)
@@ -626,14 +726,36 @@ void ViewportCamera::MaybeCapture()
   gz::math::Pose3d refPose;
   uint8_t refMode = SetReferenceFrame::Request::FULL;
   std::optional<gz::math::Pose3d> refTargetPose;
+  bool requestState = false;
+  bool wait = false;
   {
     std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
     if (!this->dataPtr->captureRequested)
       return;
-    // Defer while the scene hasn't caught up to the requested sim time yet; the
-    // request stays pending and a later render (after state propagation) retries.
-    if (this->dataPtr->latestSimTime < this->dataPtr->captureMinSimTime)
+    // A gated capture pulls the server's state and reads the sim time off the reply:
+    // the GUI's own time only moves with the throttled state feed. Without a runner
+    // to hand the state to, defer until that feed catches up.
+    const bool pull = this->dataPtr->guiRunner && !this->dataPtr->stateAsyncSrv.empty();
+    if (!pull && this->dataPtr->latestSimTime < this->dataPtr->captureMinSimTime)
       return;
+    if (this->dataPtr->captureMinSimTime.count() > 0)
+    {
+      using Stage = ViewportCameraPrivate::CaptureStage;
+      if (this->dataPtr->captureStage == Stage::AwaitTime)
+      {
+        requestState = pull;
+        this->dataPtr->captureStage = pull ? Stage::AwaitState : Stage::Settle;
+      }
+      if (this->dataPtr->captureStage == Stage::AwaitState)
+      {
+        wait = true;
+      }
+      else if (this->dataPtr->captureSettle > 0)
+      {
+        --this->dataPtr->captureSettle;
+        wait = true;
+      }
+    }
     local = this->dataPtr->captureLocal;
     worldOrientation = this->dataPtr->captureWorldOrientation;
     fov = this->dataPtr->captureFov;
@@ -642,6 +764,14 @@ void ViewportCamera::MaybeCapture()
     refMode = this->dataPtr->refMode;
     refTargetPose = this->dataPtr->refTargetPose;
   }
+  if (requestState)
+  {
+    gz::msgs::StringMsg req;
+    req.set_data(this->dataPtr->stateReplySrv);
+    this->dataPtr->gzNode.Request(this->dataPtr->stateAsyncSrv, req);
+  }
+  if (wait)
+    return;
 
   // Snap to the requested pose in the active reference frame, exactly as the live
   // drive composes it, then render that frame and read the pixels back.
