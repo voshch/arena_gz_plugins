@@ -1,30 +1,44 @@
 /// PedSkeletonPlugin drives Gazebo actor pedestrians from arena_peds. Each tick,
 /// in PreUpdate (sim thread), it sets every matching actor's world pose via
-/// components::TrajectoryPose and scrubs the walk.dae clip via
-/// components::AnimationTime. gz-sim 8 exposes no supported path for arbitrary
-/// per-bone skeleton control on actors, so the in-sim mesh plays the walk clip
-/// phased by ped speed; the true 15-joint gait stays the ROS4HRI/rviz view.
+/// components::TrajectoryPose and poses its skeleton per bone via
+/// components::BoneTransforms: the wire joint angles are composed onto the
+/// neutral stance through the same bone map as the Isaac provider, so both
+/// simulators render the same articulated gait. Actors whose template cannot
+/// be bone-driven (no <bone_map>, no idle DAE, no skin skeleton) and every
+/// actor of a build without the gz-sim overlay keep scrubbing the walk clip
+/// via components::AnimationTime.
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include <gz/math/Matrix4.hh>
 #include <gz/math/Pose3.hh>
 #include <gz/math/Quaternion.hh>
 #include <gz/math/Vector3.hh>
 
 #include <filesystem>
 #include <system_error>
+
+#include <gz/common/Mesh.hh>
+#include <gz/common/MeshManager.hh>
+#include <gz/common/Skeleton.hh>
+#include <gz/common/SkeletonAnimation.hh>
+#include <gz/common/SkeletonNode.hh>
 
 #include <gz/sim/Entity.hh>
 #include <gz/sim/EntityComponentManager.hh>
@@ -40,7 +54,10 @@
 
 #include <gz/plugin/Register.hh>
 
+#include <nlohmann/json.hpp>
+
 #include <rclcpp/rclcpp.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 #include <arena_people_msgs/msg/pedestrians.hpp>
 
 #include "arena_gz_plugins/PedSkeletonPlugin.hh"
@@ -59,7 +76,11 @@ static constexpr double kZOffset = 1.01;
 static constexpr const char * kWalkAnimName = "walk";
 // Stationary stand clip played while idle, so the body stands instead of holding
 // a frozen walk frame. Advances in real time so its light motion keeps playing.
+// Its first frame is also the rest pose shown without a fresh wire.
 static constexpr const char * kIdleAnimName = "idle";
+// Optional clip whose first frame the wire angles compose onto. Without it the
+// idle clip's first frame is used.
+static constexpr const char * kNeutralAnimName = "neutral";
 // walk.dae advances its root 1.384 m over its 5.79 s clip, a 0.239 m/s natural
 // stride, so the cursor advances speed/0.239 per second to keep the feet planted.
 static constexpr double kWalkRefSpeed = 0.239;
@@ -69,6 +90,16 @@ static constexpr double kIdleSpeed = 0.05;
 static constexpr double kMaxExtrap = 0.5;
 // 2*pi, converts a gait phase in radians to a fraction of the walk clip.
 static constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+// Wire frames buffered per ped.
+static constexpr std::size_t kAngleBufferLen = 32;
+// Assumed wire period with fewer than 2 buffered frames.
+static constexpr double kDefaultPeriod = 0.05;
+// Interpolation delay, in wire periods.
+static constexpr double kInterpDelayPeriods = 1.5;
+// Wire age beyond which the pose blends back to the rest pose.
+static constexpr double kStalenessS = 0.5;
+// Blend ramp between the rest pose and the wire pose.
+static constexpr double kBlendS = 0.3;
 
 /// Create-or-update a component and flag it for SceneBroadcaster propagation.
 template <typename ComponentT, typename ValueT>
@@ -86,6 +117,36 @@ static void SetComponent(
     _entity, ComponentT::typeId, gz::sim::ComponentState::OneTimeChange);
 }
 
+/// Remove a component if the entity carries it.
+template <typename ComponentT>
+static void DropComponent(
+  gz::sim::EntityComponentManager & _ecm,
+  const gz::sim::Entity & _entity)
+{
+  if (_ecm.Component<ComponentT>(_entity) != nullptr)
+    _ecm.RemoveComponent<ComponentT>(_entity);
+}
+
+/// One wire joint's contribution to a skeleton bone's local rotation.
+struct BoneTarget
+{
+  std::string bone;
+  gz::math::Vector3d axis;
+  double gain{1.0};
+};
+
+/// Wire joint name -> targets, in bone map file order.
+using BoneMap = std::vector<std::pair<std::string, std::vector<BoneTarget>>>;
+
+/// A bone map target resolved against one skeleton.
+struct SchemaEntry
+{
+  std::size_t wireIdx{0};
+  std::size_t boneIdx{0};
+  gz::math::Vector3d axis;
+  double gain{0.0};
+};
+
 /// Parsed actor template plus per-model metadata resolved once at load time.
 struct CachedActor
 {
@@ -96,6 +157,29 @@ struct CachedActor
   // for non-BVH clips (e.g. arenian's walk.dae), which keep legacy dead
   // reckoning instead of phase lock.
   double walkClipSeconds{0.0};
+  // Skin skeleton bones (depth-first), their neutral local transforms, their
+  // rest rotations and the resolved wire schema. Empty when the template is
+  // clip-scrubbed.
+  std::vector<std::string> boneNames;
+  std::vector<gz::math::Pose3d> neutral;
+  std::vector<gz::math::Quaterniond> rest;
+  std::vector<SchemaEntry> schema;
+
+  bool BoneDriven() const { return !boneNames.empty(); }
+};
+
+/// One received wire frame, angles in bone map order.
+struct WireFrame
+{
+  double stamp{0.0};
+  std::vector<double> angles;
+};
+
+/// Per-ped wire buffer and blend weight.
+struct BoneDriver
+{
+  std::deque<WireFrame> frames;
+  double weight{0.0};
 };
 
 /// Parse a BVH MOTION header for "Frames:" and "Frame Time:" and return their
@@ -149,31 +233,184 @@ static double ParseBvhDuration(const std::string & path)
   return (frames >= 0 && frameTime >= 0) ? static_cast<double>(frames) * frameTime : 0.0;
 }
 
+/// The actor's animation with the given name, nullptr if absent.
+static const sdf::Animation * FindAnimation(const sdf::Actor & actor, const std::string & name)
+{
+  for (uint64_t i = 0; i < actor.AnimationCount(); ++i)
+  {
+    const sdf::Animation * anim = actor.AnimationByIndex(i);
+    if (anim != nullptr && anim->Name() == name)
+      return anim;
+  }
+  return nullptr;
+}
+
+/// Resolve an actor-relative filename against the actor SDF's directory.
+static std::filesystem::path ResolveActorFile(
+  const std::string & filename, const std::string & actorFile)
+{
+  std::filesystem::path path(filename);
+  if (!path.is_absolute())
+    path = std::filesystem::path(actorFile).parent_path() / path;
+  return path;
+}
+
 /// Resolve the "walk" animation's clip relative to the actor SDF's directory
 /// and, if it is a BVH, return its duration. 0.0 for non-BVH clips (walk.dae)
 /// or a missing walk animation.
 static double WalkClipDuration(const sdf::Actor & actor, const std::string & actorFile)
 {
-  const sdf::Animation * walkAnim = nullptr;
-  for (uint64_t i = 0; i < actor.AnimationCount(); ++i)
-  {
-    const sdf::Animation * anim = actor.AnimationByIndex(i);
-    if (anim != nullptr && anim->Name() == kWalkAnimName)
-    {
-      walkAnim = anim;
-      break;
-    }
-  }
+  const sdf::Animation * walkAnim = FindAnimation(actor, kWalkAnimName);
   if (walkAnim == nullptr)
     return 0.0;
 
-  std::filesystem::path clipPath(walkAnim->Filename());
-  if (!clipPath.is_absolute())
-    clipPath = std::filesystem::path(actorFile).parent_path() / clipPath;
+  const auto clipPath = ResolveActorFile(walkAnim->Filename(), actorFile);
   if (clipPath.extension() != ".bvh")
     return 0.0;
 
   return ParseBvhDuration(clipPath.string());
+}
+
+/// Read the bone map JSON ({wire name: [{bone, axis, sign, scale}, ...]})
+/// preserving key order. false (warned) if the file is missing or malformed.
+static bool LoadBoneMap(const std::string & path, BoneMap & boneMap)
+{
+  std::ifstream file(path);
+  if (!file.is_open())
+  {
+    gzwarn << "[PedSkeletonPlugin] cannot open bone map '" << path
+           << "', actors keep the clip-scrub path\n";
+    return false;
+  }
+  try
+  {
+    const auto doc = nlohmann::ordered_json::parse(file);
+    if (!doc.is_object())
+    {
+      gzwarn << "[PedSkeletonPlugin] bone map '" << path
+             << "' root is not an object, actors keep the clip-scrub path\n";
+      return false;
+    }
+    for (const auto & [name, targets] : doc.items())
+    {
+      std::vector<BoneTarget> parsed;
+      for (const auto & target : targets)
+      {
+        const auto & axis = target.at("axis");
+        parsed.push_back({
+          target.at("bone").get<std::string>(),
+          gz::math::Vector3d(
+            axis.at(0).get<double>(), axis.at(1).get<double>(), axis.at(2).get<double>()),
+          target.at("sign").get<double>() * target.value("scale", 1.0)});
+      }
+      boneMap.emplace_back(name, std::move(parsed));
+    }
+  }
+  catch (const nlohmann::json::exception & e)
+  {
+    gzwarn << "[PedSkeletonPlugin] bone map '" << path << "' is malformed ("
+           << e.what() << "), actors keep the clip-scrub path\n";
+    boneMap.clear();
+    return false;
+  }
+  return true;
+}
+
+/// First frame of an actor clip by bone name, false (warned) unless it is a
+/// DAE with an animation.
+static bool ClipFirstFrame(
+  const sdf::Animation & anim, const std::string & actorFile,
+  std::map<std::string, gz::math::Matrix4d> & frame)
+{
+  const auto clipPath = ResolveActorFile(anim.Filename(), actorFile);
+  if (clipPath.extension() != ".dae")
+  {
+    gzwarn << "[PedSkeletonPlugin] " << anim.Name() << " clip '" << clipPath.string()
+           << "' is not a DAE, clip-scrubbing '" << actorFile << "'\n";
+    return false;
+  }
+  const gz::common::Mesh * clip = gz::common::MeshManager::Instance()->Load(clipPath.string());
+  const gz::common::SkeletonPtr clipSkel =
+    (clip != nullptr && clip->HasSkeleton()) ? clip->MeshSkeleton() : nullptr;
+  if (clipSkel == nullptr || clipSkel->AnimationCount() == 0)
+  {
+    gzwarn << "[PedSkeletonPlugin] " << anim.Name() << " clip '" << clipPath.string()
+           << "' has no animation, clip-scrubbing '" << actorFile << "'\n";
+    return false;
+  }
+  frame = clipSkel->Animation(0)->PoseAt(0.0, false);
+  return true;
+}
+
+/// Fill the template's bones, rest pose (idle clip first frame), neutral
+/// stance (neutral clip first frame, the rest pose without one) and wire schema
+/// from its skin skeleton. The root and unanimated bones take their skin
+/// transform. Leaves the template clip-scrubbed (warned) when any input is
+/// unavailable.
+static void LoadBoneDrive(
+  CachedActor & entry, const std::string & actorFile, const BoneMap & boneMap)
+{
+  const sdf::Animation * idleAnim = FindAnimation(entry.actor, kIdleAnimName);
+  if (idleAnim == nullptr)
+  {
+    gzwarn << "[PedSkeletonPlugin] '" << actorFile << "' has no '" << kIdleAnimName
+           << "' animation, clip-scrubbing it\n";
+    return;
+  }
+  std::map<std::string, gz::math::Matrix4d> restFrame;
+  if (!ClipFirstFrame(*idleAnim, actorFile, restFrame))
+    return;
+  std::map<std::string, gz::math::Matrix4d> neutralFrame = restFrame;
+  const sdf::Animation * neutralAnim = FindAnimation(entry.actor, kNeutralAnimName);
+  if (neutralAnim != nullptr && !ClipFirstFrame(*neutralAnim, actorFile, neutralFrame))
+    return;
+
+  const auto skinPath = ResolveActorFile(entry.actor.SkinFilename(), actorFile);
+  const gz::common::Mesh * skin = gz::common::MeshManager::Instance()->Load(skinPath.string());
+  const gz::common::SkeletonPtr skel =
+    (skin != nullptr && skin->HasSkeleton()) ? skin->MeshSkeleton() : nullptr;
+  if (skel == nullptr || skel->RootNode() == nullptr)
+  {
+    gzwarn << "[PedSkeletonPlugin] skin '" << skinPath.string()
+           << "' has no skeleton, clip-scrubbing '" << actorFile << "'\n";
+    return;
+  }
+
+  std::vector<gz::common::SkeletonNode *> stack{skel->RootNode()};
+  while (!stack.empty())
+  {
+    gz::common::SkeletonNode * node = stack.back();
+    stack.pop_back();
+    const auto local = [node](const std::map<std::string, gz::math::Matrix4d> & frame)
+      {
+        const auto channel = frame.find(node->Name());
+        return (node->IsRootNode() || channel == frame.end()) ? node->Transform() : channel->second;
+      };
+    const gz::math::Matrix4d neutral = local(neutralFrame);
+    entry.boneNames.push_back(node->Name());
+    entry.neutral.emplace_back(neutral.Translation(), neutral.Rotation().Normalized());
+    entry.rest.push_back(local(restFrame).Rotation().Normalized());
+    for (unsigned int i = node->ChildCount(); i > 0; --i)
+      stack.push_back(node->Child(i - 1));
+  }
+
+  std::unordered_map<std::string, std::size_t> boneIndex;
+  for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
+    boneIndex.emplace(entry.boneNames[b], b);
+  for (std::size_t w = 0; w < boneMap.size(); ++w)
+  {
+    for (const auto & target : boneMap[w].second)
+    {
+      const auto bone = boneIndex.find(target.bone);
+      if (bone == boneIndex.end())
+        continue;
+      const double norm = target.axis.Length();
+      entry.schema.push_back({
+        w, bone->second,
+        norm > 0.0 ? target.axis / norm : gz::math::Vector3d::Zero,
+        norm > 0.0 ? target.gain : 0.0});
+    }
+  }
 }
 
 class PedSkeletonPluginPrivate
@@ -215,6 +452,13 @@ public:
   gz::sim::Entity worldEntity{gz::sim::kNullEntity};
   gz::sim::EventManager * eventMgr{nullptr};
 
+  // Wire joint -> bone targets from <bone_map>, empty when bone-driving is off.
+  BoneMap boneMap;
+  std::unordered_map<std::string, std::size_t> wireIndex;
+  // name -> buffered wire frames and blend weight, under pedsMutex.
+  std::unordered_map<std::string, BoneDriver> boneDrivers;
+  std::unordered_set<std::string> warnedJoints;
+
   // ROS spin thread, keeps rclcpp work off the sim thread.
   std::thread spinThread;
   std::atomic<bool> stopSpin{false};
@@ -245,6 +489,40 @@ public:
     }
   }
 
+  static double StampSeconds(const builtin_interfaces::msg::Time & stamp)
+  {
+    return static_cast<double>(stamp.sec) + stamp.nanosec * 1e-9;
+  }
+
+  /// Buffer one ped's wire joint angles in bone map order. Caller holds pedsMutex.
+  void PushWireFrame(
+    const arena_people_msgs::msg::Pedestrians & msg,
+    const arena_people_msgs::msg::Pedestrian & ped)
+  {
+    const auto & joints = ped.joint_state;
+    const bool ownStamp =
+      joints.header.stamp.sec != 0 || joints.header.stamp.nanosec != 0;
+    WireFrame frame{
+      StampSeconds(ownStamp ? joints.header.stamp : msg.header.stamp),
+      std::vector<double>(boneMap.size(), 0.0)};
+    for (std::size_t i = 0; i < joints.name.size() && i < joints.position.size(); ++i)
+    {
+      const auto wire = wireIndex.find(joints.name[i]);
+      if (wire == wireIndex.end())
+      {
+        if (warnedJoints.insert(joints.name[i]).second)
+          gzwarn << "[PedSkeletonPlugin] unrecognized joint name '" << joints.name[i]
+                 << "', ignoring\n";
+        continue;
+      }
+      frame.angles[wire->second] = joints.position[i];
+    }
+    auto & driver = boneDrivers[ped.name];
+    driver.frames.push_back(std::move(frame));
+    if (driver.frames.size() > kAngleBufferLen)
+      driver.frames.pop_front();
+  }
+
   void SubscribeTopic(const std::string & topic)
   {
     if (subscriptions.count(topic))
@@ -265,6 +543,8 @@ public:
             pendingRemovals.erase(ped.name);  // reappeared before removal ran
             if (!ped.model_uri.empty())
               pedModelPath[ped.name] = ped.model_uri;
+            if (!boneMap.empty() && !ped.joint_state.name.empty())
+              PushWireFrame(*msg, ped);
           }
           // Names present last message but gone now are ejected: drop their
           // state and queue the actor for removal.
@@ -276,6 +556,7 @@ public:
               pedState.erase(name);
               pedSeq.erase(name);
               pedModelPath.erase(name);
+              boneDrivers.erase(name);
               pendingRemovals.insert(name);
             }
           }
@@ -343,7 +624,115 @@ public:
     entry.actor = *root.Actor();
     entry.groundZ = entry.actor.RawPose().Pos().Z();
     entry.walkClipSeconds = WalkClipDuration(entry.actor, file);
+    if (!boneMap.empty())
+      LoadBoneDrive(entry, file, boneMap);
     return &actorTemplates.emplace(path, std::move(entry)).first->second;
+  }
+
+  /// Mean of the last four positive stamp gaps, kDefaultPeriod with fewer
+  /// than two frames or no positive gap.
+  static double WirePeriod(const std::deque<WireFrame> & frames)
+  {
+    if (frames.size() < 2)
+      return kDefaultPeriod;
+    const std::size_t first = frames.size() > 5 ? frames.size() - 5 : 0;
+    double sum = 0.0;
+    int gaps = 0;
+    for (std::size_t i = first + 1; i < frames.size(); ++i)
+    {
+      const double gap = frames[i].stamp - frames[i - 1].stamp;
+      if (gap > 0.0)
+      {
+        sum += gap;
+        ++gaps;
+      }
+    }
+    return gaps > 0 ? sum / gaps : kDefaultPeriod;
+  }
+
+  /// Angles at time t, linearly interpolated between the bracketing frames and
+  /// clamped at both ends. frames must be non-empty.
+  static std::vector<double> SampleWire(const std::deque<WireFrame> & frames, double t)
+  {
+    if (frames.size() == 1 || t <= frames.front().stamp)
+      return frames.front().angles;
+    if (t >= frames.back().stamp)
+      return frames.back().angles;
+
+    const auto upper = std::upper_bound(
+      frames.begin(), frames.end(), t,
+      [](double value, const WireFrame & frame) { return value < frame.stamp; });
+    const auto idx = static_cast<std::size_t>(std::clamp<std::ptrdiff_t>(
+      std::distance(frames.begin(), upper) - 1, 0,
+      static_cast<std::ptrdiff_t>(frames.size()) - 2));
+    const WireFrame & a = frames[idx];
+    const WireFrame & b = frames[idx + 1];
+    const double span = b.stamp - a.stamp;
+    const double alpha = span <= 0.0 ? 0.0 : (t - a.stamp) / span;
+    std::vector<double> angles(a.angles.size());
+    for (std::size_t k = 0; k < angles.size(); ++k)
+      angles[k] = (1.0 - alpha) * a.angles[k] + alpha * b.angles[k];
+    return angles;
+  }
+
+  /// Ramp the blend weight and slerp from the rest pose to the
+  /// delay-compensated wire angles composed onto the neutral stance. Caller
+  /// holds pedsMutex.
+  static void BlendWire(
+    BoneDriver & driver, const CachedActor & tmpl, double simTime, double dt,
+    std::vector<gz::math::Quaterniond> & rotation)
+  {
+    if (driver.frames.empty())
+    {
+      driver.weight = 0.0;
+      return;
+    }
+    const double target = (simTime - driver.frames.back().stamp) > kStalenessS ? 0.0 : 1.0;
+    const double step = dt / kBlendS;
+    driver.weight = (target > driver.weight)
+      ? std::min(target, driver.weight + step)
+      : std::max(target, driver.weight - step);
+    if (driver.weight <= 0.0)
+      return;
+
+    const std::vector<double> angles =
+      SampleWire(driver.frames, simTime - kInterpDelayPeriods * WirePeriod(driver.frames));
+    std::vector<gz::math::Quaterniond> wire(tmpl.neutral.size());
+    for (std::size_t b = 0; b < wire.size(); ++b)
+      wire[b] = tmpl.neutral[b].Rot();
+    for (const auto & entry : tmpl.schema)
+    {
+      const gz::math::Quaterniond delta(entry.axis, entry.gain * angles[entry.wireIdx]);
+      wire[entry.boneIdx] = (wire[entry.boneIdx] * delta).Normalized();
+    }
+    for (std::size_t b = 0; b < rotation.size(); ++b)
+      rotation[b] = gz::math::Quaterniond::Slerp(driver.weight, tmpl.rest[b], wire[b], true);
+  }
+
+  /// Local transform of every bone of a bone-driven template for one ped:
+  /// the wire pose where frames are buffered and fresh, the rest pose
+  /// otherwise.
+  std::map<std::string, gz::math::Pose3d> EvaluateBones(
+    const std::string & pedName, const CachedActor & tmpl, double simTime, double dt)
+  {
+    std::vector<gz::math::Quaterniond> rotation = tmpl.rest;
+    {
+      std::lock_guard<std::mutex> lock(pedsMutex);
+      const auto driver = boneDrivers.find(pedName);
+      if (driver != boneDrivers.end())
+        BlendWire(driver->second, tmpl, simTime, dt, rotation);
+    }
+    std::map<std::string, gz::math::Pose3d> bones;
+    for (std::size_t b = 0; b < rotation.size(); ++b)
+      bones.emplace(tmpl.boneNames[b], gz::math::Pose3d(tmpl.neutral[b].Pos(), rotation[b]));
+    return bones;
+  }
+
+  /// Drop a ped's buffered wire frames and blend weight.
+  void ResetBoneDriver(const std::string & pedName)
+  {
+    std::lock_guard<std::mutex> lock(pedsMutex);
+    boneDrivers[pedName] = BoneDriver{};
   }
 };
 
@@ -373,6 +762,27 @@ void PedSkeletonPlugin::Configure(
   dataPtr->worldEntity = _entity;
   dataPtr->eventMgr = &_eventMgr;
 
+#ifndef ARENA_GZ_BONE_TRANSFORMS
+  gzwarn << "[PedSkeletonPlugin] built without BoneTransforms (no gz-sim overlay), "
+         << "actors keep the clip-scrub path\n";
+#else
+  if (!_sdf->HasElement("bone_map"))
+  {
+    gzwarn << "[PedSkeletonPlugin] no <bone_map>, actors keep the clip-scrub path\n";
+  }
+  else
+  {
+    const auto bonePath = _sdf->Get<std::string>("bone_map");
+    if (LoadBoneMap(bonePath, dataPtr->boneMap))
+    {
+      for (std::size_t w = 0; w < dataPtr->boneMap.size(); ++w)
+        dataPtr->wireIndex.emplace(dataPtr->boneMap[w].first, w);
+      gzmsg << "[PedSkeletonPlugin] bone map '" << bonePath << "' maps "
+            << dataPtr->boneMap.size() << " wire joints\n";
+    }
+  }
+#endif
+
   if (!rclcpp::ok())
     rclcpp::init(0, nullptr);
 
@@ -380,7 +790,7 @@ void PedSkeletonPlugin::Configure(
   dataPtr->spinThread =
     std::thread(&PedSkeletonPluginPrivate::SpinLoop, dataPtr.get());
 
-  gzmsg << "[PedSkeletonPlugin] configured, driving actor pose + walk clip.\n";
+  gzmsg << "[PedSkeletonPlugin] configured, driving actor pose + skeleton.\n";
 }
 
 void PedSkeletonPlugin::PreUpdate(
@@ -465,6 +875,17 @@ void PedSkeletonPlugin::PreUpdate(
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+      if (tmpl != nullptr && tmpl->BoneDriven())
+      {
+        DropComponent<gz::sim::components::AnimationName>(_ecm, entity);
+        DropComponent<gz::sim::components::AnimationTime>(_ecm, entity);
+        SetComponent<gz::sim::components::BoneTransforms>(
+          _ecm, entity, dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt));
+        return true;
+      }
+#endif
+
       // Idle peds stand (real-time stand clip); moving peds walk with the clip
       // phased to ground speed so the feet stay planted.
       const double speed = std::hypot(ped.twist.linear.x, ped.twist.linear.y);
@@ -538,6 +959,14 @@ void PedSkeletonPlugin::PreUpdate(
           ped.pose.orientation.y, ped.pose.orientation.z));
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+      if (tmpl->BoneDriven())
+      {
+        dataPtr->ResetBoneDriver(pedName);
+        SetComponent<gz::sim::components::BoneTransforms>(
+          _ecm, entity, dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt));
+      }
+#endif
       gzmsg << "[PedSkeletonPlugin] spawned actor '" << pedName << "'\n";
     }
   }

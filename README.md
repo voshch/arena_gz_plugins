@@ -6,8 +6,8 @@ gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: a server-side **system** plugi
 ## PedSkeletonPlugin
 
 Drives Gazebo **actor** pedestrians from the `arena_peds` topic: it positions
-each actor and plays the `walk.dae` clip phased to the ped's speed, so the
-in-sim body walks in step with the canonical gait.
+each actor and poses its skeleton per bone from the wire joint angles, so the
+in-sim body renders the same articulated gait as Isaac.
 
 ### What it does
 
@@ -22,12 +22,15 @@ for every actor whose `Name` matches a `Pedestrian.name`:
    `arena_peds` samples the position is dead-reckoned by the ped's twist (re-anchored
    on each fresh sample, clamped to `kMaxExtrap`) so the body slides smoothly instead
    of stepping.
-2. **Animation** — when moving, sets `components::AnimationName` to the `walk` clip
-   and advances `components::AnimationTime` by `speed / kWalkRefSpeed` per second,
-   where `kWalkRefSpeed` is walk.dae's natural stride speed (1.384 m over its 5.79 s
-   clip = 0.239 m/s), keeping the feet planted at the ped's ground speed. Below
-   `kIdleSpeed` it switches to the stationary `idle` (stand.dae) clip, advanced in
-   real time, so the body stands with light motion instead of a frozen walk frame.
+2. **Skeleton**: sets `components::BoneTransforms`, the local transform of every
+   skin bone, from the ped's `joint_state` (see below). Templates that cannot be
+   bone-driven fall back to the clip scrub: when moving, `components::AnimationName`
+   is the `walk` clip and `components::AnimationTime` advances by
+   `speed / kWalkRefSpeed` per second, where `kWalkRefSpeed` is walk.dae's natural
+   stride speed (1.384 m over its 5.79 s clip = 0.239 m/s), keeping the feet planted
+   at the ped's ground speed. Below `kIdleSpeed` it switches to the stationary `idle`
+   clip, advanced in real time, so the body stands with light motion instead of a
+   frozen walk frame.
 
 `arena_peds` carries the full active ped set per message, so a name that was present
 and is now absent has been **ejected**: the plugin drops its state and removes the
@@ -36,14 +39,32 @@ actor entity (`RequestRemoveEntity`), so despawn is driven entirely by topic abs
 
 Both components flow through gz's `RenderUtil` to the GUI **and** `gpu_lidar`.
 
-### Why clip-scrub and not per-bone
+### Per-bone driving
 
-gz-sim 8 has no supported path for external per-bone skeleton control on actors:
-`RenderUtil::UpdateAnimation` re-enables skeleton animation every frame and clears
-any manual-bone flags, and the only real per-bone path (`actorManualSkeletonUpdate`)
-has no public setter. So the in-sim mesh plays the canned walk clip. The true
-articulated gait (`GaitGenerator` joint angles) remains the ROS4HRI/rviz and Isaac
-view; Gazebo's body is a clip-scrub approximation of it.
+`components::BoneTransforms` (gz-sim) carries each skeleton bone's local transform
+by name and takes precedence over `AnimationName`/`AnimationTime` on the render side.
+The plugin fills it the way the Isaac provider does: the `<bone_map>` JSON maps each
+wire joint (`joint_state.name`) to bone targets (`bone`, bone-local `axis`, `sign`,
+`scale`), the rest pose is the `idle` clip's first frame per bone (the skin
+transform for the root and for bones without a channel), the neutral stance is the
+first frame of an optional `neutral` clip (the rest pose without one), and each tick
+the wire angles, buffered per ped and sampled 1.5 periods behind sim time, rotate
+their target bones about their axes on top of the neutral stance. A blend weight
+slerps from the rest pose to that wire pose and ramps to zero when the wire is older
+than 0.5 s, so a ped without a fresh wire shows the rest pose. A template without a
+bone map, a `.dae` idle clip or a skin skeleton keeps the clip-scrub path.
+
+`BoneTransforms` is not in stock gz-sim 8. It comes from the gz-sim overlay that
+`arena feature gazebo update` builds, which then rebuilds this package. CMake checks
+for the component, and a build against stock gz-sim warns and clip-scrubs every
+actor.
+
+```xml
+<plugin filename="PedSkeletonPlugin" name="arena_gz_plugins::PedSkeletonPlugin">
+  <enabled>true</enabled>
+  <bone_map>/abs/path/bone_map.json</bone_map>
+</plugin>
+```
 
 ### gpu_lidar rationale
 
@@ -67,9 +88,11 @@ When enabled, `arena_bringup/launch/simulator/sim/gazebo/gazebo.launch.py` injec
 ### Actor asset
 
 The pedestrian is `arena_simulation_setup/assets/Common/Pedestrian/arenian/arenian.sdf`:
-an `<actor>` with the walk.dae `<skin>` and `<animation name="walk">` /
-`<animation name="idle">` (stand.dae) clips. The `walk` and `idle` names are the
-contract the plugin passes to `AnimationName`.
+an `<actor>` with a skinned `<skin>` mesh and `<animation name="walk">` /
+`<animation name="idle">` clips. `idle` is the rest pose of the per-bone path
+and, with `walk`, the clip the fallback passes to `AnimationName`. A bundle whose
+rest pose is not the stance its wire angles assume (a seated wheelchair user) adds
+`<animation name="neutral">` with that stance.
 
 ## ViewportCamera
 

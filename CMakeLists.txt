@@ -10,6 +10,12 @@ set(GZ_SIM_VER ${gz-sim8_VERSION_MAJOR})
 # gz-math 7 (Pose3d / Quaterniond)
 find_package(gz-math7 REQUIRED)
 
+# gz-common 5 graphics (skin skeleton + idle clip for per-bone actor driving)
+find_package(gz-common5 REQUIRED COMPONENTS graphics)
+
+# bone map JSON
+find_package(nlohmann_json REQUIRED)
+
 # sdformat 14 (sdf::Root / sdf::Actor, for runtime actor creation)
 find_package(sdformat14 REQUIRED)
 
@@ -37,10 +43,27 @@ target_include_directories(PedSkeletonPlugin PUBLIC
 target_link_libraries(PedSkeletonPlugin PUBLIC
   gz-sim${GZ_SIM_VER}::gz-sim${GZ_SIM_VER}
   gz-math7::gz-math7
+  gz-common5::graphics
   sdformat14::sdformat14
+  nlohmann_json::nlohmann_json
   rclcpp::rclcpp
   ${arena_people_msgs_TARGETS}
 )
+
+# components::BoneTransforms comes from the gz-sim overlay (arena feature gazebo update)
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_LIBRARIES gz-sim${GZ_SIM_VER}::gz-sim${GZ_SIM_VER})
+check_cxx_source_compiles("
+#include <gz/sim/components/Actor.hh>
+int main() { gz::sim::components::BoneTransforms bones; return 0; }
+" GZ_SIM_HAS_BONE_TRANSFORMS)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(GZ_SIM_HAS_BONE_TRANSFORMS)
+  target_compile_definitions(PedSkeletonPlugin PRIVATE ARENA_GZ_BONE_TRANSFORMS)
+else()
+  message(WARNING "gz-sim${GZ_SIM_VER} has no BoneTransforms component, PedSkeletonPlugin "
+    "scrubs actor clips only. `arena feature gazebo update` builds the overlay.")
+endif()
 
 install(TARGETS PedSkeletonPlugin
   LIBRARY DESTINATION lib

@@ -12,15 +12,21 @@ class PedSkeletonPluginPrivate;
 
 /// System plugin that drives each Gazebo actor pedestrian from the arena_peds
 /// ROS 2 topic. In PreUpdate (sim thread) it sets every matching actor's world
-/// pose via components::TrajectoryPose and scrubs the walk.dae clip via
-/// components::AnimationTime. The motion reaches both the GUI and gpu_lidar
-/// through the shared RenderUtil path.
+/// pose via components::TrajectoryPose and poses its skeleton per bone via
+/// components::BoneTransforms, composing the wire joint angles onto the
+/// neutral stance through the bone map shared with the Isaac provider.
+/// Without the gz-sim overlay, a usable bone map, idle DAE or skin skeleton
+/// the actor scrubs the walk clip via components::AnimationTime instead. The
+/// motion reaches both the GUI and gpu_lidar through the shared RenderUtil
+/// path.
 ///
 /// SDF element (inside <world> or as a server plugin):
 ///   <plugin filename="PedSkeletonPlugin"
 ///           name="arena_gz_plugins::PedSkeletonPlugin">
 ///     <!-- Set to false to disable actor driving entirely -->
 ///     <enabled>true</enabled>
+///     <!-- Wire joint -> bone target JSON, omit to keep clip scrubbing -->
+///     <bone_map>/abs/path/bone_map.json</bone_map>
 ///   </plugin>
 ///
 /// Topic discovery is automatic: the plugin scans all advertised ROS 2 topics
