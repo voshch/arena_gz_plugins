@@ -178,6 +178,7 @@ struct Keyframe
   gz::math::Pose3d local;
   bool worldOrientation;
   double fov;  // <= 0 leaves fov unchanged
+  double clipNear;  // 0 leaves it unchanged, < 0 restores the default
 };
 
 // Sim-agnostic interpolation core: sample the buffered keyframes at _now, lerping
@@ -186,7 +187,7 @@ struct Keyframe
 // A jitter buffer like this is why publish rate stops mattering: as long as a
 // keyframe leads _now, a late or missing publish is invisible.
 void SampleBuffer(const std::deque<Keyframe> & _buf, const rclcpp::Time & _now,
-  gz::math::Pose3d & _local, bool & _worldOrientation, double & _fov)
+  gz::math::Pose3d & _local, bool & _worldOrientation, double & _fov, double & _clipNear)
 {
   if (_buf.empty())
     return;
@@ -195,6 +196,7 @@ void SampleBuffer(const std::deque<Keyframe> & _buf, const rclcpp::Time & _now,
     _local = _buf.front().local;
     _worldOrientation = _buf.front().worldOrientation;
     _fov = _buf.front().fov;
+    _clipNear = _buf.front().clipNear;
     return;
   }
   if (_now >= _buf.back().time)
@@ -202,6 +204,7 @@ void SampleBuffer(const std::deque<Keyframe> & _buf, const rclcpp::Time & _now,
     _local = _buf.back().local;
     _worldOrientation = _buf.back().worldOrientation;
     _fov = _buf.back().fov;
+    _clipNear = _buf.back().clipNear;
     return;
   }
   std::size_t i = 1;
@@ -216,6 +219,7 @@ void SampleBuffer(const std::deque<Keyframe> & _buf, const rclcpp::Time & _now,
     gz::math::Quaterniond::Slerp(alpha, a.local.Rot(), b.local.Rot(), true));
   _worldOrientation = b.worldOrientation;
   _fov = b.fov > 0.0 ? b.fov : a.fov;
+  _clipNear = b.clipNear != 0.0 ? b.clipNear : a.clipNear;
 }
 }  // namespace
 
@@ -302,7 +306,9 @@ public:
   bool worldOrientation{false};        // keep the aim world-stable (one-shot path)
   std::deque<Keyframe> viewBuffer;     // streamed keyframes, interpolated by time
   std::optional<double> pendingFov;
+  std::optional<double> pendingClipNear;
   std::optional<gz::rendering::CameraProjectionType> pendingProjection;
+  double defaultClipNear{0.0};        // the user camera's own near clip, read when found
 
   std::string refEntity;               // tracked entity, empty -> constant refPose
   std::string warnedEntity;            // last entity logged as missing (warn once)
@@ -321,6 +327,7 @@ public:
   gz::math::Pose3d captureLocal;       // local pose to snap to for the grab
   bool captureWorldOrientation{false};
   double captureFov{0.0};
+  double captureClipNear{0.0};
   std::chrono::steady_clock::duration captureMinSimTime{0};  // defer until latestSimTime reaches this
   enum class CaptureStage { AwaitTime, AwaitState, Settle };
   CaptureStage captureStage{CaptureStage::AwaitTime};  // progress of a gated capture
@@ -378,6 +385,8 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
         this->dataPtr->localSet = true;
         if (_req->fov > 0.0)
           this->dataPtr->pendingFov = _req->fov;
+        if (_req->clip_near != 0.0)
+          this->dataPtr->pendingClipNear = _req->clip_near;
       }
       _res->success = true;
       _res->message = "ok";
@@ -458,6 +467,7 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
       kf.local = ToPose(_msg->pose);
       kf.worldOrientation = _msg->world_orientation;
       kf.fov = _msg->fov;
+      kf.clipNear = _msg->clip_near;
       std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
       this->dataPtr->viewBuffer.push_back(kf);
       this->dataPtr->streaming = true;
@@ -474,6 +484,7 @@ void ViewportCamera::LoadConfig(const tinyxml2::XMLElement *)
       this->dataPtr->captureLocal = ToPose(_req->pose);
       this->dataPtr->captureWorldOrientation = _req->world_orientation;
       this->dataPtr->captureFov = _req->fov;
+      this->dataPtr->captureClipNear = _req->clip_near;
       this->dataPtr->captureMinSimTime = ToDuration(_req->min_sim_time);
       this->dataPtr->captureStage = ViewportCameraPrivate::CaptureStage::AwaitTime;
       this->dataPtr->captureSettle = kCaptureSettleRenders;
@@ -598,6 +609,7 @@ void ViewportCamera::RefreshCamera()
     if (isUser && *isUser)
     {
       this->dataPtr->camera = cam;
+      this->dataPtr->defaultClipNear = cam->NearClipPlane();
       return;
     }
   }
@@ -612,7 +624,9 @@ void ViewportCamera::ApplyToCamera()
   gz::math::Pose3d localPose;
   bool worldOrientation = false;
   double sampledFov = 0.0;
+  double sampledClipNear = 0.0;
   std::optional<double> pendingFov;
+  std::optional<double> pendingClipNear;
   std::optional<gz::rendering::CameraProjectionType> pendingProjection;
   std::string refEntity;
   gz::math::Pose3d refPose;
@@ -641,9 +655,11 @@ void ViewportCamera::ApplyToCamera()
     }
     else
     {
-      SampleBuffer(this->dataPtr->viewBuffer, now, localPose, worldOrientation, sampledFov);
+      SampleBuffer(
+        this->dataPtr->viewBuffer, now, localPose, worldOrientation, sampledFov, sampledClipNear);
     }
     std::swap(pendingFov, this->dataPtr->pendingFov);
+    std::swap(pendingClipNear, this->dataPtr->pendingClipNear);
     std::swap(pendingProjection, this->dataPtr->pendingProjection);
     refEntity = this->dataPtr->refEntity;
     refPose = this->dataPtr->refPose;
@@ -658,6 +674,7 @@ void ViewportCamera::ApplyToCamera()
     camera->SetHFOV(gz::math::Angle(*pendingFov));
   else if (sampledFov > 0.0)
     camera->SetHFOV(gz::math::Angle(sampledFov));
+  this->ApplyClipNear(pendingClipNear ? *pendingClipNear : streaming ? sampledClipNear : 0.0);
 
   // Resolve the reference world pose. A tracked entity that isn't sampled yet
   // (still spawning, or a wrong name) falls back to the world origin so the shot
@@ -717,11 +734,20 @@ void ViewportCamera::ApplyToCamera()
   }
 }
 
+void ViewportCamera::ApplyClipNear(double _clipNear)
+{
+  if (_clipNear == 0.0)
+    return;
+  this->dataPtr->camera->SetNearClipPlane(
+    _clipNear > 0.0 ? _clipNear : this->dataPtr->defaultClipNear);
+}
+
 void ViewportCamera::MaybeCapture()
 {
   gz::math::Pose3d local;
   bool worldOrientation = false;
   double fov = 0.0;
+  double clipNear = 0.0;
   std::string refEntity;
   gz::math::Pose3d refPose;
   uint8_t refMode = SetReferenceFrame::Request::FULL;
@@ -759,6 +785,7 @@ void ViewportCamera::MaybeCapture()
     local = this->dataPtr->captureLocal;
     worldOrientation = this->dataPtr->captureWorldOrientation;
     fov = this->dataPtr->captureFov;
+    clipNear = this->dataPtr->captureClipNear;
     refEntity = this->dataPtr->refEntity;
     refPose = this->dataPtr->refPose;
     refMode = this->dataPtr->refMode;
@@ -781,6 +808,7 @@ void ViewportCamera::MaybeCapture()
   camera->SetWorldPose(world);
   if (fov > 0.0)
     camera->SetHFOV(gz::math::Angle(fov));
+  this->ApplyClipNear(clipNear);
 
   sensor_msgs::msg::Image image;
   bool ok = false;

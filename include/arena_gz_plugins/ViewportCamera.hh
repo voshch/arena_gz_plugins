@@ -55,6 +55,9 @@ private:
   /// Drain queued commands onto the camera and publish its pose. Render thread.
   void ApplyToCamera();
 
+  /// Set the near clip in m, a negative value restores the camera's own, 0 is a no-op.
+  void ApplyClipNear(double _clipNear);
+
   /// Fulfil a pending capture request: snap to the exact pose, render, read the
   /// pixels back, and wake the waiting service. No-op if none pending. Render thread.
   void MaybeCapture();
