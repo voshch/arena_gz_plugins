@@ -17,6 +17,7 @@
 #include <deque>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -39,6 +40,7 @@
 #include <gz/common/Skeleton.hh>
 #include <gz/common/SkeletonAnimation.hh>
 #include <gz/common/SkeletonNode.hh>
+#include <gz/common/SubMesh.hh>
 
 #include <gz/sim/Entity.hh>
 #include <gz/sim/EntityComponentManager.hh>
@@ -81,6 +83,14 @@ static constexpr const char * kIdleAnimName = "idle";
 // Optional clip whose first frame the wire angles compose onto. Without it the
 // idle clip's first frame is used.
 static constexpr const char * kNeutralAnimName = "neutral";
+// Bones whose neutral stance is their skin transform.
+static const std::unordered_set<std::string> kBindStanceBones{
+  "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase",
+  "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase"};
+// Bones that carry a rig on wheels, which then keeps its SDF ground offset.
+static const std::unordered_set<std::string> kWheelBones{"WheelL", "WheelR"};
+// Meters above a foot's lowest bind vertex that still count as sole.
+static constexpr double kSoleBand = 0.01;
 // walk.dae advances its root 1.384 m over its 5.79 s clip, a 0.239 m/s natural
 // stride, so the cursor advances speed/0.239 per second to keep the feet planted.
 static constexpr double kWalkRefSpeed = 0.239;
@@ -161,9 +171,13 @@ struct CachedActor
   // rest rotations and the resolved wire schema. Empty when the template is
   // clip-scrubbed.
   std::vector<std::string> boneNames;
+  std::vector<int> boneParents;
   std::vector<gz::math::Pose3d> neutral;
   std::vector<gz::math::Quaterniond> rest;
   std::vector<SchemaEntry> schema;
+  // Heel and toe sole point of each foot, as bone index and point in that
+  // bone's frame. Empty for a rig on wheels.
+  std::vector<std::pair<std::size_t, gz::math::Vector3d>> soles;
 
   bool BoneDriven() const { return !boneNames.empty(); }
 };
@@ -342,11 +356,106 @@ static bool ClipFirstFrame(
   return true;
 }
 
+/// Heel and toe sole point of each foot in the frame of the bone it rides on,
+/// none for a rig on wheels.
+static std::vector<std::pair<std::size_t, gz::math::Vector3d>> SolePoints(
+  const gz::common::Mesh & skin, const gz::common::Skeleton & skel,
+  const std::unordered_map<std::string, std::size_t> & boneIndex)
+{
+  std::vector<std::pair<std::size_t, gz::math::Vector3d>> soles;
+  for (const auto & wheel : kWheelBones)
+  {
+    if (boneIndex.count(wheel) > 0)
+      return soles;
+  }
+  const gz::math::Matrix4d bindShape = skel.BindShapeTransform();
+  for (const std::string side : {"Left", "Right"})
+  {
+    const gz::common::SkeletonNode * foot = skel.NodeByName(side + "Foot");
+    const gz::common::SkeletonNode * toe = skel.NodeByName(side + "ToeBase");
+    if (foot == nullptr || toe == nullptr)
+      continue;
+    std::vector<std::pair<gz::math::Vector3d, const gz::common::SkeletonNode *>> cloud;
+    for (unsigned int s = 0; s < skin.SubMeshCount(); ++s)
+    {
+      const auto sub = skin.SubMeshByIndex(s).lock();
+      if (!sub)
+        continue;
+      std::vector<float> weight(sub->VertexCount(), 0.0f);
+      std::vector<const gz::common::SkeletonNode *> owner(sub->VertexCount(), nullptr);
+      for (unsigned int a = 0; a < sub->NodeAssignmentsCount(); ++a)
+      {
+        const gz::common::NodeAssignment assignment = sub->NodeAssignmentByIndex(a);
+        if (assignment.vertexIndex < weight.size() && assignment.weight > weight[assignment.vertexIndex])
+        {
+          weight[assignment.vertexIndex] = assignment.weight;
+          owner[assignment.vertexIndex] = skel.NodeByHandle(assignment.nodeIndex);
+        }
+      }
+      for (unsigned int v = 0; v < sub->VertexCount(); ++v)
+      {
+        if (owner[v] == foot || owner[v] == toe)
+          cloud.emplace_back(bindShape * sub->Vertex(v), owner[v]);
+      }
+    }
+    if (cloud.empty())
+      continue;
+    gz::math::Vector3d forward = toe->InverseBindTransform().Inverse().Translation() -
+      foot->InverseBindTransform().Inverse().Translation();
+    forward.Z(0.0);
+    double lowest = cloud.front().first.Z();
+    for (const auto & vertex : cloud)
+      lowest = std::min(lowest, vertex.first.Z());
+    std::vector<std::size_t> sole;
+    double front = -std::numeric_limits<double>::infinity();
+    double back = std::numeric_limits<double>::infinity();
+    for (std::size_t v = 0; v < cloud.size(); ++v)
+    {
+      if (cloud[v].first.Z() > lowest + kSoleBand)
+        continue;
+      sole.push_back(v);
+      front = std::max(front, cloud[v].first.Dot(forward));
+      back = std::min(back, cloud[v].first.Dot(forward));
+    }
+    const double middle = 0.5 * (front + back);
+    for (const bool ahead : {false, true})
+    {
+      const std::pair<gz::math::Vector3d, const gz::common::SkeletonNode *> * pick = nullptr;
+      for (const std::size_t v : sole)
+      {
+        if ((cloud[v].first.Dot(forward) > middle) == ahead &&
+            (pick == nullptr || cloud[v].first.Z() < pick->first.Z()))
+          pick = &cloud[v];
+      }
+      if (pick != nullptr)
+        soles.emplace_back(boneIndex.at(pick->second->Name()), pick->second->InverseBindTransform() * pick->first);
+    }
+  }
+  return soles;
+}
+
+/// Height of a template's lowest sole point above the skeleton origin for
+/// one set of bone-local poses.
+static double SoleHeight(
+  const CachedActor & tmpl, const std::map<std::string, gz::math::Pose3d> & bones)
+{
+  std::vector<gz::math::Matrix4d> world(tmpl.boneNames.size());
+  for (std::size_t b = 0; b < world.size(); ++b)
+  {
+    const gz::math::Matrix4d local(bones.at(tmpl.boneNames[b]));
+    world[b] = tmpl.boneParents[b] < 0 ? local : world[tmpl.boneParents[b]] * local;
+  }
+  double height = std::numeric_limits<double>::infinity();
+  for (const auto & [bone, point] : tmpl.soles)
+    height = std::min(height, (world[bone] * point).Z());
+  return height;
+}
+
 /// Fill the template's bones, rest pose (idle clip first frame), neutral
 /// stance (neutral clip first frame, the rest pose without one) and wire schema
 /// from its skin skeleton. The root and unanimated bones take their skin
-/// transform. Leaves the template clip-scrubbed (warned) when any input is
-/// unavailable.
+/// transform, and so do the kBindStanceBones in the neutral stance. Leaves the
+/// template clip-scrubbed (warned) when any input is unavailable.
 static void LoadBoneDrive(
   CachedActor & entry, const std::string & actorFile, const BoneMap & boneMap)
 {
@@ -376,27 +485,31 @@ static void LoadBoneDrive(
     return;
   }
 
-  std::vector<gz::common::SkeletonNode *> stack{skel->RootNode()};
+  std::vector<std::pair<gz::common::SkeletonNode *, int>> stack{{skel->RootNode(), -1}};
   while (!stack.empty())
   {
-    gz::common::SkeletonNode * node = stack.back();
+    const auto [node, parent] = stack.back();
     stack.pop_back();
     const auto local = [node](const std::map<std::string, gz::math::Matrix4d> & frame)
       {
         const auto channel = frame.find(node->Name());
         return (node->IsRootNode() || channel == frame.end()) ? node->Transform() : channel->second;
       };
-    const gz::math::Matrix4d neutral = local(neutralFrame);
+    const gz::math::Matrix4d neutral =
+      kBindStanceBones.count(node->Name()) > 0 ? node->Transform() : local(neutralFrame);
+    const int index = static_cast<int>(entry.boneNames.size());
     entry.boneNames.push_back(node->Name());
+    entry.boneParents.push_back(parent);
     entry.neutral.emplace_back(neutral.Translation(), neutral.Rotation().Normalized());
     entry.rest.push_back(local(restFrame).Rotation().Normalized());
     for (unsigned int i = node->ChildCount(); i > 0; --i)
-      stack.push_back(node->Child(i - 1));
+      stack.emplace_back(node->Child(i - 1), index);
   }
 
   std::unordered_map<std::string, std::size_t> boneIndex;
   for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
     boneIndex.emplace(entry.boneNames[b], b);
+  entry.soles = SolePoints(*skin, *skel, boneIndex);
   for (std::size_t w = 0; w < boneMap.size(); ++w)
   {
     for (const auto & target : boneMap[w].second)
@@ -862,7 +975,16 @@ void PedSkeletonPlugin::PreUpdate(
 
       const CachedActor * tmpl = (pathIt != modelPaths.end())
         ? dataPtr->ActorTemplate(pathIt->second) : nullptr;
-      const double groundZ = (tmpl != nullptr) ? tmpl->groundZ : kZOffset;
+      double groundZ = (tmpl != nullptr) ? tmpl->groundZ : kZOffset;
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+      std::map<std::string, gz::math::Pose3d> bones;
+      if (tmpl != nullptr && tmpl->BoneDriven())
+      {
+        bones = dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt);
+        if (!tmpl->soles.empty())
+          groundZ = -SoleHeight(*tmpl, bones);
+      }
+#endif
 
       gz::math::Pose3d worldPose(
         gz::math::Vector3d(
@@ -880,8 +1002,7 @@ void PedSkeletonPlugin::PreUpdate(
       {
         DropComponent<gz::sim::components::AnimationName>(_ecm, entity);
         DropComponent<gz::sim::components::AnimationTime>(_ecm, entity);
-        SetComponent<gz::sim::components::BoneTransforms>(
-          _ecm, entity, dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt));
+        SetComponent<gz::sim::components::BoneTransforms>(_ecm, entity, bones);
         return true;
       }
 #endif
@@ -949,11 +1070,22 @@ void PedSkeletonPlugin::PreUpdate(
 
       // Place immediately so the actor does not flash at the origin before the
       // drive pass picks it up next tick.
+      double groundZ = tmpl->groundZ;
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+      std::map<std::string, gz::math::Pose3d> bones;
+      if (tmpl->BoneDriven())
+      {
+        dataPtr->ResetBoneDriver(pedName);
+        bones = dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt);
+        if (!tmpl->soles.empty())
+          groundZ = -SoleHeight(*tmpl, bones);
+      }
+#endif
       const gz::math::Pose3d worldPose(
         gz::math::Vector3d(
           ped.pose.position.x,
           ped.pose.position.y,
-          ped.pose.position.z + tmpl->groundZ),
+          ped.pose.position.z + groundZ),
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
@@ -961,11 +1093,7 @@ void PedSkeletonPlugin::PreUpdate(
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 #ifdef ARENA_GZ_BONE_TRANSFORMS
       if (tmpl->BoneDriven())
-      {
-        dataPtr->ResetBoneDriver(pedName);
-        SetComponent<gz::sim::components::BoneTransforms>(
-          _ecm, entity, dataPtr->EvaluateBones(pedName, *tmpl, simTimeSec, dt));
-      }
+        SetComponent<gz::sim::components::BoneTransforms>(_ecm, entity, bones);
 #endif
       gzmsg << "[PedSkeletonPlugin] spawned actor '" << pedName << "'\n";
     }

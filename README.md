@@ -47,11 +47,16 @@ The plugin fills it the way the Isaac provider does: the `<bone_map>` JSON maps 
 wire joint (`joint_state.name`) to bone targets (`bone`, bone-local `axis`, `sign`,
 `scale`), the rest pose is the `idle` clip's first frame per bone (the skin
 transform for the root and for bones without a channel), the neutral stance is the
-first frame of an optional `neutral` clip (the rest pose without one), and each tick
+first frame of an optional `neutral` clip (the rest pose without one) with the legs
+(`UpLeg`, `Leg`, `Foot`, `ToeBase`) at their skin transform, and each tick
 the wire angles, buffered per ped and sampled 1.5 periods behind sim time, rotate
 their target bones about their axes on top of the neutral stance. A blend weight
 slerps from the rest pose to that wire pose and ramps to zero when the wire is older
-than 0.5 s, so a ped without a fresh wire shows the rest pose. A template without a
+than 0.5 s, so a ped without a fresh wire shows the rest pose.
+The actor then stands on its lowest sole point: a heel and a toe point per foot, the
+lowest skin vertices behind and ahead of the foot's middle, ride on their bones, and
+the actor's z is set each tick so the lowest of them is at the floor. A rig on wheels
+(`WheelL`, `WheelR` bones) has none and keeps the SDF ground offset. A template without a
 bone map, a `.dae` idle clip or a skin skeleton keeps the clip-scrub path.
 
 `BoneTransforms` is not in stock gz-sim 8. It comes from the gz-sim overlay that
