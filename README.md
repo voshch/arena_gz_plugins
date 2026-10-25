@@ -55,7 +55,8 @@ slerps from the rest pose to that wire pose and ramps to zero when the wire is o
 than 0.5 s, so a ped without a fresh wire shows the rest pose.
 The actor then stands on its lowest sole point: a heel and a toe point per foot, the
 lowest skin vertices behind and ahead of the foot's middle, ride on their bones, and
-the actor's z is set each tick so the lowest of them is at the floor. A rig on wheels
+the actor moves along the wire pose's up axis each tick until the lowest of them is level
+with the pose, the floor for a standing ped. A rig on wheels
 (`WheelL`, `WheelR` bones) has none and keeps the SDF ground offset. A template without a
 bone map, a `.dae` idle clip or a skin skeleton keeps the clip-scrub path.
 
