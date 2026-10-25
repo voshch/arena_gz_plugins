@@ -51,6 +51,8 @@
 #include <gz/sim/components/Name.hh>
 #include <gz/sim/components/Pose.hh>
 
+#include "arena_gz_plugins/Support.hh"
+
 #include <sdf/Actor.hh>
 #include <sdf/Root.hh>
 
@@ -179,6 +181,11 @@ struct CachedActor
   // Heel and toe sole point of each foot, as bone index and point in that
   // bone's frame. Empty for a rig on wheels.
   std::vector<std::pair<std::size_t, gz::math::Vector3d>> soles;
+  // Index of the pelvis bone (kPelvisBone), -1 without one: such a rig is
+  // not set down on seats or beds.
+  int pelvis{-1};
+  // The character's pelvis clearance over a seat or bed, from its annotation.
+  PelvisClearance clearance;
 
   bool BoneDriven() const { return !boneNames.empty(); }
 };
@@ -435,9 +442,9 @@ static std::vector<std::pair<std::size_t, gz::math::Vector3d>> SolePoints(
   return soles;
 }
 
-/// Height of a template's lowest sole point above the skeleton origin for
-/// one set of bone-local poses.
-static double SoleHeight(
+/// Skeleton-frame transform of every bone of a template for one set of
+/// bone-local poses.
+static std::vector<gz::math::Matrix4d> BoneWorlds(
   const CachedActor & tmpl, const std::map<std::string, gz::math::Pose3d> & bones)
 {
   std::vector<gz::math::Matrix4d> world(tmpl.boneNames.size());
@@ -446,6 +453,15 @@ static double SoleHeight(
     const gz::math::Matrix4d local(bones.at(tmpl.boneNames[b]));
     world[b] = tmpl.boneParents[b] < 0 ? local : world[tmpl.boneParents[b]] * local;
   }
+  return world;
+}
+
+/// Height of a template's lowest sole point above the skeleton origin for
+/// one set of bone-local poses.
+static double SoleHeight(
+  const CachedActor & tmpl, const std::map<std::string, gz::math::Pose3d> & bones)
+{
+  const std::vector<gz::math::Matrix4d> world = BoneWorlds(tmpl, bones);
   double height = std::numeric_limits<double>::infinity();
   for (const auto & [bone, point] : tmpl.soles)
     height = std::min(height, (world[bone] * point).Z());
@@ -553,6 +569,8 @@ static void LoadBoneDrive(
   for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
     boneIndex.emplace(entry.boneNames[b], b);
   entry.soles = SolePoints(*skin, *skel, boneIndex);
+  const auto pelvis = boneIndex.find(kPelvisBone);
+  entry.pelvis = pelvis == boneIndex.end() ? -1 : static_cast<int>(pelvis->second);
   for (std::size_t w = 0; w < boneMap.size(); ++w)
   {
     for (const auto & target : boneMap[w].second)
@@ -780,6 +798,7 @@ public:
     entry.actor = *root.Actor();
     entry.groundZ = entry.actor.RawPose().Pos().Z();
     entry.walkClipSeconds = WalkClipDuration(entry.actor, file);
+    entry.clearance = ReadPelvisClearance(file);
     if (!boneMap.empty())
       LoadBoneDrive(entry, file, boneMap);
     return &actorTemplates.emplace(path, std::move(entry)).first->second;
@@ -1037,6 +1056,19 @@ void PedSkeletonPlugin::PreUpdate(
         gz::math::Quaterniond(
           ped.pose.orientation.w, ped.pose.orientation.x,
           ped.pose.orientation.y, ped.pose.orientation.z));
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+      // A ped resting on a seat or a bed is set down on its surface.
+      if (tmpl != nullptr && tmpl->BoneDriven() && tmpl->pelvis >= 0 &&
+        (ped.interaction_type == kSitOn || ped.interaction_type == kLieOn) &&
+        ped.support_height != arena_people_msgs::msg::Pedestrian::NO_SUPPORT)
+      {
+        const gz::math::Vector3d spot(
+          worldPose.Pos().X(), worldPose.Pos().Y(), ped.pose.position.z);
+        worldPose = SupportedPose(
+          ped.interaction_type, ped.support_height, tmpl->clearance, spot, worldPose.Rot(),
+          BoneWorlds(*tmpl, bones)[tmpl->pelvis].Translation(), groundZ);
+      }
+#endif
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 

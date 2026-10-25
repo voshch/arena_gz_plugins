@@ -16,6 +16,8 @@
   <!-- gz-common 5 graphics (skin skeleton + idle clip) and the bone map JSON -->
   <depend>gz-common5</depend>
   <depend>nlohmann-json-dev</depend>
+  <!-- character annotations (pelvis clearance) -->
+  <depend>yaml-cpp</depend>
   <!-- gz-gui 8 / gz-rendering 8 / Qt 5 (ViewportCamera GUI plugin) -->
   <depend>gz-gui8</depend>
   <depend>gz-rendering8</depend>
@@ -28,6 +30,8 @@
   <depend>sensor_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>viewport_control_msgs</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

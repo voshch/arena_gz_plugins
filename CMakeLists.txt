@@ -16,6 +16,9 @@ find_package(gz-common5 REQUIRED COMPONENTS graphics)
 # bone map JSON
 find_package(nlohmann_json REQUIRED)
 
+# character annotations (pelvis clearance)
+find_package(yaml-cpp REQUIRED)
+
 # sdformat 14 (sdf::Root / sdf::Actor, for runtime actor creation)
 find_package(sdformat14 REQUIRED)
 
@@ -33,6 +36,19 @@ find_package(sensor_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(viewport_control_msgs REQUIRED)
 
+# seat and bed placement, gz-math only so it is testable without a simulator
+add_library(arena_gz_support STATIC
+  src/Support.cc
+)
+set_target_properties(arena_gz_support PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(arena_gz_support PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(arena_gz_support PUBLIC
+  gz-math7::gz-math7
+  yaml-cpp::yaml-cpp
+)
+
 add_library(PedSkeletonPlugin SHARED
   src/PedSkeletonPlugin.cc
 )
@@ -41,6 +57,7 @@ target_include_directories(PedSkeletonPlugin PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(PedSkeletonPlugin PUBLIC
+  arena_gz_support
   gz-sim${GZ_SIM_VER}::gz-sim${GZ_SIM_VER}
   gz-math7::gz-math7
   gz-common5::graphics
@@ -104,5 +121,11 @@ install(TARGETS ViewportCamera
 install(DIRECTORY include/
   DESTINATION include
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_support test/test_support.cc)
+  target_link_libraries(test_support arena_gz_support)
+endif()
 
 ament_package()
