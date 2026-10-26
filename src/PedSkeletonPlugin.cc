@@ -83,7 +83,8 @@ static constexpr const char * kIdleAnimName = "idle";
 // Optional clip whose first frame the wire angles compose onto. Without it the
 // idle clip's first frame is used.
 static constexpr const char * kNeutralAnimName = "neutral";
-// Bones whose neutral stance is their skin transform.
+// Bones whose neutral stance is their skin transform, thighs and shanks then
+// hung straight down (HangLegs).
 static const std::unordered_set<std::string> kBindStanceBones{
   "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase",
   "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase"};
@@ -451,11 +452,52 @@ static double SoleHeight(
   return height;
 }
 
+/// Swing each UpLeg and Leg of the template's neutral stance to point straight
+/// down, each Foot keeping its world orientation.
+static void HangLegs(CachedActor & entry)
+{
+  std::unordered_map<std::string, std::size_t> index;
+  for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
+    index.emplace(entry.boneNames[b], b);
+  const auto worlds = [&entry]()
+    {
+      std::vector<gz::math::Matrix4d> world(entry.neutral.size());
+      for (std::size_t b = 0; b < world.size(); ++b)
+      {
+        const gz::math::Matrix4d local(entry.neutral[b]);
+        world[b] = entry.boneParents[b] < 0 ? local : world[entry.boneParents[b]] * local;
+      }
+      return world;
+    };
+  for (const std::string side : {"Left", "Right"})
+  {
+    const auto upleg = index.find(side + "UpLeg");
+    const auto leg = index.find(side + "Leg");
+    const auto foot = index.find(side + "Foot");
+    if (upleg == index.end() || leg == index.end() || foot == index.end())
+      continue;
+    const gz::math::Quaterniond footWorld = worlds()[foot->second].Rotation();
+    for (const auto & [bone, child] :
+      {std::pair{upleg->second, leg->second}, std::pair{leg->second, foot->second}})
+    {
+      const auto world = worlds();
+      gz::math::Quaterniond swing;
+      swing.SetFrom2Axes(
+        world[child].Translation() - world[bone].Translation(), -gz::math::Vector3d::UnitZ);
+      const gz::math::Quaterniond parent = world[entry.boneParents[bone]].Rotation();
+      entry.neutral[bone].Rot() = (parent.Inverse() * swing * world[bone].Rotation()).Normalized();
+    }
+    const gz::math::Quaterniond parent = worlds()[entry.boneParents[foot->second]].Rotation();
+    entry.neutral[foot->second].Rot() = (parent.Inverse() * footWorld).Normalized();
+  }
+}
+
 /// Fill the template's bones, rest pose (idle clip first frame), neutral
 /// stance (neutral clip first frame, the rest pose without one) and wire schema
 /// from its skin skeleton. The root and unanimated bones take their skin
-/// transform, and so do the kBindStanceBones in the neutral stance. Leaves the
-/// template clip-scrubbed (warned) when any input is unavailable.
+/// transform, and so do the kBindStanceBones in the neutral stance before
+/// HangLegs. Leaves the template clip-scrubbed (warned) when any input is
+/// unavailable.
 static void LoadBoneDrive(
   CachedActor & entry, const std::string & actorFile, const BoneMap & boneMap)
 {
@@ -505,6 +547,7 @@ static void LoadBoneDrive(
     for (unsigned int i = node->ChildCount(); i > 0; --i)
       stack.emplace_back(node->Child(i - 1), index);
   }
+  HangLegs(entry);
 
   std::unordered_map<std::string, std::size_t> boneIndex;
   for (std::size_t b = 0; b < entry.boneNames.size(); ++b)

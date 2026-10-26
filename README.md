@@ -48,7 +48,8 @@ wire joint (`joint_state.name`) to bone targets (`bone`, bone-local `axis`, `sig
 `scale`), the rest pose is the `idle` clip's first frame per bone (the skin
 transform for the root and for bones without a channel), the neutral stance is the
 first frame of an optional `neutral` clip (the rest pose without one) with the legs
-(`UpLeg`, `Leg`, `Foot`, `ToeBase`) at their skin transform, and each tick
+(`UpLeg`, `Leg`, `Foot`, `ToeBase`) at their skin transform, thighs and shanks then
+swung to hang straight down and the feet keeping their skin orientation, and each tick
 the wire angles, buffered per ped and sampled 1.5 periods behind sim time, rotate
 their target bones about their axes on top of the neutral stance. A blend weight
 slerps from the rest pose to that wire pose and ramps to zero when the wire is older
