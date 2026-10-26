@@ -12,8 +12,8 @@ in-sim body renders the same articulated gait as Isaac.
 ### What it does
 
 `Configure` starts an `rclcpp` node on a dedicated spin thread that discovers and
-subscribes to every `*/arena_peds` topic (any number of env namespaces, no SDF
-config). Each `PreUpdate` (sim thread) snapshots the latest pedestrian state and,
+subscribes to every `*/arena_peds` topic (any number of env namespaces), or to
+every topic ending in `<topic_suffix>` when the plugin SDF sets one. Each `PreUpdate` (sim thread) snapshots the latest pedestrian state and,
 for every actor whose `Name` matches a `Pedestrian.name`:
 
 1. **Position** — sets `components::TrajectoryPose` to the ped's world pose and
@@ -69,6 +69,7 @@ actor.
 <plugin filename="PedSkeletonPlugin" name="arena_gz_plugins::PedSkeletonPlugin">
   <enabled>true</enabled>
   <bone_map>/abs/path/bone_map.json</bone_map>
+  <topic_suffix>/sim_peds</topic_suffix>
 </plugin>
 ```
 

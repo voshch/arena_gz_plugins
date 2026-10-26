@@ -582,6 +582,9 @@ public:
   std::unordered_map<std::string, arena_people_msgs::msg::Pedestrian> pedState;
   std::unordered_map<std::string, uint64_t> pedSeq;
 
+  // ped topics end in this, <topic_suffix> in the plugin SDF
+  std::string topicSuffix{"/arena_peds"};
+
   // Last ped-name set seen on each topic. arena_peds carries the full active set
   // per message, so a name that was present and is now absent has been ejected.
   std::unordered_map<std::string, std::unordered_set<std::string>> topicPeds;
@@ -720,12 +723,12 @@ public:
         });
   }
 
-  /// Scan all advertised topics ending in "/arena_peds" and subscribe.
+  /// Scan all advertised topics ending in the topic suffix and subscribe.
   void DiscoverTopics()
   {
     if (!rosNode)
       return;
-    static const std::string suffix = "/arena_peds";
+    const std::string & suffix = topicSuffix;
     for (const auto & [topic, types] : rosNode->get_topic_names_and_types())
     {
       if (topic.size() >= suffix.size() &&
@@ -907,6 +910,8 @@ void PedSkeletonPlugin::Configure(
 {
   if (_sdf->HasElement("enabled"))
     dataPtr->enabled = _sdf->Get<bool>("enabled");
+  if (_sdf->HasElement("topic_suffix"))
+    dataPtr->topicSuffix = _sdf->Get<std::string>("topic_suffix");
 
   if (!dataPtr->enabled)
   {
