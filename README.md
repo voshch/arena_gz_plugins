@@ -1,7 +1,7 @@
 # arena_gz_plugins
 
-gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: a server-side **system** plugin
-(`PedSkeletonPlugin`) and a **GUI** plugin (`ViewportCamera`).
+gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: server-side **system** plugins
+(`PedSkeletonPlugin`, `ArticulatedDrive`) and a **GUI** plugin (`ViewportCamera`).
 
 ## PedSkeletonPlugin
 
@@ -100,6 +100,21 @@ an `<actor>` with a skinned `<skin>` mesh and `<animation name="walk">` /
 and, with `walk`, the clip the fallback passes to `AnimationName`. A bundle whose
 rest pose is not the stance its wire angles assume (a seated wheelchair user) adds
 `<animation name="neutral">` with that stance.
+
+## ArticulatedDrive
+
+Model plugin of every articulated object arena_runtime spawns in Gazebo
+(`_articulated_sdf` in `gazebo_simulator.py` writes it into the model SDF). It
+takes one `<joint name stiffness damping effort wraps initial/>` per movable
+joint, sets each joint to `initial` at rest on its first update, and from then
+on reads `gz.msgs.Double_V` commands on `/model/<model>/articulated/command`,
+three values per joint in the configured order: reference, drive (0 or 1) and
+place (1 sets the joint onto the reference at rest). While a joint's drive is on
+it applies `stiffness * error - damping * velocity`, clamped to `effort`, the
+error taken the short way round for a `wraps` joint. Off, the joint moves only
+under its SDF `<dynamics>` damping and friction and its contacts. Joint
+positions go out on `/model/<model>/articulated/state` as `gz.msgs.Double_V`
+at 60 Hz of sim time and right after a placement.
 
 ## ViewportCamera
 
