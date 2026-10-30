@@ -69,6 +69,20 @@ install(TARGETS PedSkeletonPlugin
   LIBRARY DESTINATION lib
 )
 
+add_library(ArticulatedDrive SHARED
+  src/ArticulatedDrive.cc
+)
+target_include_directories(ArticulatedDrive PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(ArticulatedDrive PUBLIC
+  gz-sim${GZ_SIM_VER}::gz-sim${GZ_SIM_VER}
+)
+install(TARGETS ArticulatedDrive
+  LIBRARY DESTINATION lib
+)
+
 # GUI plugin: moc the Q_OBJECT header explicitly so its meta-object, vtable and
 # typeinfo are emitted (gz dlopens the plugin and resolves its typeinfo); qrc embeds
 # the card QML.

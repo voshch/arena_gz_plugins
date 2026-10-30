@@ -1,7 +1,7 @@
 # arena_gz_plugins
 
-gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: a server-side **system** plugin
-(`PedSkeletonPlugin`) and a **GUI** plugin (`ViewportCamera`).
+gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: server-side **system** plugins
+(`PedSkeletonPlugin`, `ArticulatedDrive`) and a **GUI** plugin (`ViewportCamera`).
 
 ## PedSkeletonPlugin
 
@@ -56,7 +56,8 @@ slerps from the rest pose to that wire pose and ramps to zero when the wire is o
 than 0.5 s, so a ped without a fresh wire shows the rest pose.
 The actor then stands on its lowest sole point: a heel and a toe point per foot, the
 lowest skin vertices behind and ahead of the foot's middle, ride on their bones, and
-the actor's z is set each tick so the lowest of them is at the floor. A rig on wheels
+the actor moves along the wire pose's up axis each tick until the lowest of them is level
+with the pose, the floor for a standing ped. A rig on wheels
 (`WheelL`, `WheelR` bones) has none and keeps the SDF ground offset. A template without a
 bone map, a `.dae` idle clip or a skin skeleton keeps the clip-scrub path.
 
@@ -100,6 +101,21 @@ an `<actor>` with a skinned `<skin>` mesh and `<animation name="walk">` /
 and, with `walk`, the clip the fallback passes to `AnimationName`. A bundle whose
 rest pose is not the stance its wire angles assume (a seated wheelchair user) adds
 `<animation name="neutral">` with that stance.
+
+## ArticulatedDrive
+
+Model plugin of every articulated object arena_runtime spawns in Gazebo
+(`_articulated_sdf` in `gazebo_simulator.py` writes it into the model SDF). It
+takes one `<joint name stiffness damping effort wraps initial/>` per movable
+joint, sets each joint to `initial` at rest on its first update, and from then
+on reads `gz.msgs.Double_V` commands on `/model/<model>/articulated/command`,
+three values per joint in the configured order: reference, drive (0 or 1) and
+place (1 sets the joint onto the reference at rest). While a joint's drive is on
+it applies `stiffness * error - damping * velocity`, clamped to `effort`, the
+error taken the short way round for a `wraps` joint. Off, the joint moves only
+under its SDF `<dynamics>` damping and friction and its contacts. Joint
+positions go out on `/model/<model>/articulated/state` as `gz.msgs.Double_V`
+at 60 Hz of sim time and right after a placement.
 
 ## ViewportCamera
 

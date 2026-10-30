@@ -1034,14 +1034,16 @@ void PedSkeletonPlugin::PreUpdate(
       }
 #endif
 
+      const gz::math::Quaterniond orientation(
+        ped.pose.orientation.w, ped.pose.orientation.x,
+        ped.pose.orientation.y, ped.pose.orientation.z);
       gz::math::Pose3d worldPose(
         gz::math::Vector3d(
           ped.pose.position.x + ped.twist.linear.x * elapsed,
           ped.pose.position.y + ped.twist.linear.y * elapsed,
-          ped.pose.position.z + groundZ),
-        gz::math::Quaterniond(
-          ped.pose.orientation.w, ped.pose.orientation.x,
-          ped.pose.orientation.y, ped.pose.orientation.z));
+          ped.pose.position.z) +
+        orientation.RotateVector(gz::math::Vector3d(0.0, 0.0, groundZ)),
+        orientation);
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 
@@ -1129,14 +1131,16 @@ void PedSkeletonPlugin::PreUpdate(
           groundZ = -SoleHeight(*tmpl, bones);
       }
 #endif
+      const gz::math::Quaterniond orientation(
+        ped.pose.orientation.w, ped.pose.orientation.x,
+        ped.pose.orientation.y, ped.pose.orientation.z);
       const gz::math::Pose3d worldPose(
         gz::math::Vector3d(
           ped.pose.position.x,
           ped.pose.position.y,
-          ped.pose.position.z + groundZ),
-        gz::math::Quaterniond(
-          ped.pose.orientation.w, ped.pose.orientation.x,
-          ped.pose.orientation.y, ped.pose.orientation.z));
+          ped.pose.position.z) +
+        orientation.RotateVector(gz::math::Vector3d(0.0, 0.0, groundZ)),
+        orientation);
       SetComponent<gz::sim::components::Pose>(_ecm, entity, gz::math::Pose3d::Zero);
       SetComponent<gz::sim::components::TrajectoryPose>(_ecm, entity, worldPose);
 #ifdef ARENA_GZ_BONE_TRANSFORMS
