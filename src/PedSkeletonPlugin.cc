@@ -1,12 +1,12 @@
 /// PedSkeletonPlugin drives Gazebo actor pedestrians from arena_peds. Each tick,
 /// in PreUpdate (sim thread), it sets every matching actor's world pose via
 /// components::TrajectoryPose and poses its skeleton per bone via
-/// components::BoneTransforms: the wire joint angles are composed onto the
-/// neutral stance through the same bone map as the Isaac provider, so both
-/// simulators render the same articulated gait. Actors whose template cannot
-/// be bone-driven (no <bone_map>, no idle DAE, no skin skeleton) and every
-/// actor of a build without the gz-sim overlay keep scrubbing the walk clip
-/// via components::AnimationTime.
+/// components::BoneTransforms: the wire body pose is mapped onto the skin bones
+/// through the rig/<name>.rig beside the actor SDF, so every simulator renders the same
+/// articulated body. Actors whose template cannot be bone-driven (no .rig
+/// file, no idle DAE, no skin skeleton) and every actor of a build
+/// without the gz-sim overlay keep scrubbing the walk clip via
+/// components::AnimationTime.
 
 #include <algorithm>
 #include <atomic>
@@ -56,12 +56,11 @@
 
 #include <gz/plugin/Register.hh>
 
-#include <nlohmann/json.hpp>
-
 #include <rclcpp/rclcpp.hpp>
 #include <builtin_interfaces/msg/time.hpp>
 #include <arena_people_msgs/msg/pedestrians.hpp>
 
+#include "arena_gz_plugins/BodyRig.hh"
 #include "arena_gz_plugins/PedSkeletonPlugin.hh"
 
 namespace arena_gz_plugins
@@ -80,16 +79,9 @@ static constexpr const char * kWalkAnimName = "walk";
 // a frozen walk frame. Advances in real time so its light motion keeps playing.
 // Its first frame is also the rest pose shown without a fresh wire.
 static constexpr const char * kIdleAnimName = "idle";
-// Optional clip whose first frame the wire angles compose onto. Without it the
-// idle clip's first frame is used.
+// Optional clip whose first frame gives the bones the rig does not map their
+// neutral rotation. Without it the idle clip's first frame is used.
 static constexpr const char * kNeutralAnimName = "neutral";
-// Bones whose neutral stance is their skin transform, thighs and shanks then
-// hung straight down (HangLegs).
-static const std::unordered_set<std::string> kBindStanceBones{
-  "LeftUpLeg", "LeftLeg", "LeftFoot", "LeftToeBase",
-  "RightUpLeg", "RightLeg", "RightFoot", "RightToeBase"};
-// Bones that carry a rig on wheels, which then keeps its SDF ground offset.
-static const std::unordered_set<std::string> kWheelBones{"WheelL", "WheelR"};
 // Meters above a foot's lowest bind vertex that still count as sole.
 static constexpr double kSoleBand = 0.01;
 // walk.dae advances its root 1.384 m over its 5.79 s clip, a 0.239 m/s natural
@@ -138,26 +130,6 @@ static void DropComponent(
     _ecm.RemoveComponent<ComponentT>(_entity);
 }
 
-/// One wire joint's contribution to a skeleton bone's local rotation.
-struct BoneTarget
-{
-  std::string bone;
-  gz::math::Vector3d axis;
-  double gain{1.0};
-};
-
-/// Wire joint name -> targets, in bone map file order.
-using BoneMap = std::vector<std::pair<std::string, std::vector<BoneTarget>>>;
-
-/// A bone map target resolved against one skeleton.
-struct SchemaEntry
-{
-  std::size_t wireIdx{0};
-  std::size_t boneIdx{0};
-  gz::math::Vector3d axis;
-  double gain{0.0};
-};
-
 /// Parsed actor template plus per-model metadata resolved once at load time.
 struct CachedActor
 {
@@ -169,13 +141,13 @@ struct CachedActor
   // reckoning instead of phase lock.
   double walkClipSeconds{0.0};
   // Skin skeleton bones (depth-first), their neutral local transforms, their
-  // rest rotations and the resolved wire schema. Empty when the template is
+  // rest rotations and the bundle rig. Empty when the template is
   // clip-scrubbed.
   std::vector<std::string> boneNames;
   std::vector<int> boneParents;
   std::vector<gz::math::Pose3d> neutral;
   std::vector<gz::math::Quaterniond> rest;
-  std::vector<SchemaEntry> schema;
+  Rig rig;
   // Heel and toe sole point of each foot, as bone index and point in that
   // bone's frame. Empty for a rig on wheels.
   std::vector<std::pair<std::size_t, gz::math::Vector3d>> soles;
@@ -183,11 +155,13 @@ struct CachedActor
   bool BoneDriven() const { return !boneNames.empty(); }
 };
 
-/// One received wire frame, angles in bone map order.
+/// One received wire frame.
 struct WireFrame
 {
   double stamp{0.0};
-  std::vector<double> angles;
+  JointRotations rotations;
+  gz::math::Vector3d rootOffset;
+  std::unordered_map<std::string, double> drivers;
 };
 
 /// Per-ped wire buffer and blend weight.
@@ -286,49 +260,31 @@ static double WalkClipDuration(const sdf::Actor & actor, const std::string & act
   return ParseBvhDuration(clipPath.string());
 }
 
-/// Read the bone map JSON ({wire name: [{bone, axis, sign, scale}, ...]})
-/// preserving key order. false (warned) if the file is missing or malformed.
-static bool LoadBoneMap(const std::string & path, BoneMap & boneMap)
+/// Load the rig/<name>.rig beside the actor SDF. false (warned) unless it is
+/// present, readable and not newer than this reader.
+static bool LoadRig(const std::filesystem::path & sdfPath, Rig & rig)
 {
-  std::ifstream file(path);
-  if (!file.is_open())
+  const auto path = sdfPath.parent_path() / (sdfPath.stem().string() + ".rig");
+  std::string detail;
+  switch (LoadRigFile(path, rig, detail))
   {
-    gzwarn << "[PedSkeletonPlugin] cannot open bone map '" << path
-           << "', actors keep the clip-scrub path\n";
-    return false;
-  }
-  try
-  {
-    const auto doc = nlohmann::ordered_json::parse(file);
-    if (!doc.is_object())
-    {
-      gzwarn << "[PedSkeletonPlugin] bone map '" << path
-             << "' root is not an object, actors keep the clip-scrub path\n";
+    case RigStatus::Loaded:
+      return true;
+    case RigStatus::Missing:
+      gzwarn << "[PedSkeletonPlugin] no rig at '" << path.string()
+             << "', run rig_human on the bundle, clip-scrubbing its actors\n";
       return false;
-    }
-    for (const auto & [name, targets] : doc.items())
-    {
-      std::vector<BoneTarget> parsed;
-      for (const auto & target : targets)
-      {
-        const auto & axis = target.at("axis");
-        parsed.push_back({
-          target.at("bone").get<std::string>(),
-          gz::math::Vector3d(
-            axis.at(0).get<double>(), axis.at(1).get<double>(), axis.at(2).get<double>()),
-          target.at("sign").get<double>() * target.value("scale", 1.0)});
-      }
-      boneMap.emplace_back(name, std::move(parsed));
-    }
+    case RigStatus::TooNew:
+      gzwarn << "[PedSkeletonPlugin] rig '" << path.string() << "' is version " << detail
+             << ", this plugin reads up to " << kRigReader
+             << ", update arena_gz_plugins, clip-scrubbing its actors\n";
+      return false;
+    case RigStatus::Malformed:
+      gzwarn << "[PedSkeletonPlugin] rig '" << path.string() << "' is malformed ("
+             << detail << "), clip-scrubbing its actors\n";
+      return false;
   }
-  catch (const nlohmann::json::exception & e)
-  {
-    gzwarn << "[PedSkeletonPlugin] bone map '" << path << "' is malformed ("
-           << e.what() << "), actors keep the clip-scrub path\n";
-    boneMap.clear();
-    return false;
-  }
-  return true;
+  return false;
 }
 
 /// First frame of an actor clip by bone name, false (warned) unless it is a
@@ -358,22 +314,23 @@ static bool ClipFirstFrame(
 }
 
 /// Heel and toe sole point of each foot in the frame of the bone it rides on,
-/// none for a rig on wheels.
+/// from the rig's soles joints. None for a rig without soles or on wheels.
 static std::vector<std::pair<std::size_t, gz::math::Vector3d>> SolePoints(
   const gz::common::Mesh & skin, const gz::common::Skeleton & skel,
-  const std::unordered_map<std::string, std::size_t> & boneIndex)
+  const std::unordered_map<std::string, std::size_t> & boneIndex, const Rig & rig)
 {
   std::vector<std::pair<std::size_t, gz::math::Vector3d>> soles;
-  for (const auto & wheel : kWheelBones)
-  {
-    if (boneIndex.count(wheel) > 0)
-      return soles;
-  }
+  if (rig.soles.size() != 4 || rig.HasDistanceDriver())
+    return soles;
   const gz::math::Matrix4d bindShape = skel.BindShapeTransform();
-  for (const std::string side : {"Left", "Right"})
+  for (const std::size_t first : {0, 2})
   {
-    const gz::common::SkeletonNode * foot = skel.NodeByName(side + "Foot");
-    const gz::common::SkeletonNode * toe = skel.NodeByName(side + "ToeBase");
+    const std::string * footBone = rig.JointBone(rig.soles[first]);
+    const std::string * toeBone = rig.JointBone(rig.soles[first + 1]);
+    if (footBone == nullptr || toeBone == nullptr)
+      continue;
+    const gz::common::SkeletonNode * foot = skel.NodeByName(*footBone);
+    const gz::common::SkeletonNode * toe = skel.NodeByName(*toeBone);
     if (foot == nullptr || toe == nullptr)
       continue;
     std::vector<std::pair<gz::math::Vector3d, const gz::common::SkeletonNode *>> cloud;
@@ -452,55 +409,16 @@ static double SoleHeight(
   return height;
 }
 
-/// Swing each UpLeg and Leg of the template's neutral stance to point straight
-/// down, each Foot keeping its world orientation.
-static void HangLegs(CachedActor & entry)
-{
-  std::unordered_map<std::string, std::size_t> index;
-  for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
-    index.emplace(entry.boneNames[b], b);
-  const auto worlds = [&entry]()
-    {
-      std::vector<gz::math::Matrix4d> world(entry.neutral.size());
-      for (std::size_t b = 0; b < world.size(); ++b)
-      {
-        const gz::math::Matrix4d local(entry.neutral[b]);
-        world[b] = entry.boneParents[b] < 0 ? local : world[entry.boneParents[b]] * local;
-      }
-      return world;
-    };
-  for (const std::string side : {"Left", "Right"})
-  {
-    const auto upleg = index.find(side + "UpLeg");
-    const auto leg = index.find(side + "Leg");
-    const auto foot = index.find(side + "Foot");
-    if (upleg == index.end() || leg == index.end() || foot == index.end())
-      continue;
-    const gz::math::Quaterniond footWorld = worlds()[foot->second].Rotation();
-    for (const auto & [bone, child] :
-      {std::pair{upleg->second, leg->second}, std::pair{leg->second, foot->second}})
-    {
-      const auto world = worlds();
-      gz::math::Quaterniond swing;
-      swing.SetFrom2Axes(
-        world[child].Translation() - world[bone].Translation(), -gz::math::Vector3d::UnitZ);
-      const gz::math::Quaterniond parent = world[entry.boneParents[bone]].Rotation();
-      entry.neutral[bone].Rot() = (parent.Inverse() * swing * world[bone].Rotation()).Normalized();
-    }
-    const gz::math::Quaterniond parent = worlds()[entry.boneParents[foot->second]].Rotation();
-    entry.neutral[foot->second].Rot() = (parent.Inverse() * footWorld).Normalized();
-  }
-}
-
 /// Fill the template's bones, rest pose (idle clip first frame), neutral
-/// stance (neutral clip first frame, the rest pose without one) and wire schema
-/// from its skin skeleton. The root and unanimated bones take their skin
-/// transform, and so do the kBindStanceBones in the neutral stance before
-/// HangLegs. Leaves the template clip-scrubbed (warned) when any input is
-/// unavailable.
-static void LoadBoneDrive(
-  CachedActor & entry, const std::string & actorFile, const BoneMap & boneMap)
+/// stance (the rig's mapped bones posed at its stance, the others at the
+/// neutral clip first frame, the rest pose without one) and rig from its skin
+/// skeleton. The root and unanimated bones take their skin transform. Leaves
+/// the template clip-scrubbed (warned) when any input is unavailable.
+static void LoadBoneDrive(CachedActor & entry, const std::string & actorFile)
 {
+  Rig rig;
+  if (!LoadRig(actorFile, rig))
+    return;
   const sdf::Animation * idleAnim = FindAnimation(entry.actor, kIdleAnimName);
   if (idleAnim == nullptr)
   {
@@ -537,8 +455,7 @@ static void LoadBoneDrive(
         const auto channel = frame.find(node->Name());
         return (node->IsRootNode() || channel == frame.end()) ? node->Transform() : channel->second;
       };
-    const gz::math::Matrix4d neutral =
-      kBindStanceBones.count(node->Name()) > 0 ? node->Transform() : local(neutralFrame);
+    const gz::math::Matrix4d neutral = local(neutralFrame);
     const int index = static_cast<int>(entry.boneNames.size());
     entry.boneNames.push_back(node->Name());
     entry.boneParents.push_back(parent);
@@ -547,26 +464,15 @@ static void LoadBoneDrive(
     for (unsigned int i = node->ChildCount(); i > 0; --i)
       stack.emplace_back(node->Child(i - 1), index);
   }
-  HangLegs(entry);
+  entry.neutral = PoseBones(
+    entry.boneNames, entry.boneParents, entry.neutral,
+    BoneWorldRotations(rig, rig.stance), {}, {}, gz::math::Vector3d::Zero);
 
   std::unordered_map<std::string, std::size_t> boneIndex;
   for (std::size_t b = 0; b < entry.boneNames.size(); ++b)
     boneIndex.emplace(entry.boneNames[b], b);
-  entry.soles = SolePoints(*skin, *skel, boneIndex);
-  for (std::size_t w = 0; w < boneMap.size(); ++w)
-  {
-    for (const auto & target : boneMap[w].second)
-    {
-      const auto bone = boneIndex.find(target.bone);
-      if (bone == boneIndex.end())
-        continue;
-      const double norm = target.axis.Length();
-      entry.schema.push_back({
-        w, bone->second,
-        norm > 0.0 ? target.axis / norm : gz::math::Vector3d::Zero,
-        norm > 0.0 ? target.gain : 0.0});
-    }
-  }
+  entry.soles = SolePoints(*skin, *skel, boneIndex, rig);
+  entry.rig = std::move(rig);
 }
 
 class PedSkeletonPluginPrivate
@@ -611,12 +517,8 @@ public:
   gz::sim::Entity worldEntity{gz::sim::kNullEntity};
   gz::sim::EventManager * eventMgr{nullptr};
 
-  // Wire joint -> bone targets from <bone_map>, empty when bone-driving is off.
-  BoneMap boneMap;
-  std::unordered_map<std::string, std::size_t> wireIndex;
   // name -> buffered wire frames and blend weight, under pedsMutex.
   std::unordered_map<std::string, BoneDriver> boneDrivers;
-  std::unordered_set<std::string> warnedJoints;
 
   // ROS spin thread, keeps rclcpp work off the sim thread.
   std::thread spinThread;
@@ -653,7 +555,8 @@ public:
     return static_cast<double>(stamp.sec) + stamp.nanosec * 1e-9;
   }
 
-  /// Buffer one ped's wire joint angles in bone map order. Caller holds pedsMutex.
+  /// Buffer one ped's wire body pose and driven joint angles. Caller holds
+  /// pedsMutex.
   void PushWireFrame(
     const arena_people_msgs::msg::Pedestrians & msg,
     const arena_people_msgs::msg::Pedestrian & ped)
@@ -661,21 +564,18 @@ public:
     const auto & joints = ped.joint_state;
     const bool ownStamp =
       joints.header.stamp.sec != 0 || joints.header.stamp.nanosec != 0;
-    WireFrame frame{
-      StampSeconds(ownStamp ? joints.header.stamp : msg.header.stamp),
-      std::vector<double>(boneMap.size(), 0.0)};
-    for (std::size_t i = 0; i < joints.name.size() && i < joints.position.size(); ++i)
+    WireFrame frame;
+    frame.stamp = StampSeconds(ownStamp ? joints.header.stamp : msg.header.stamp);
+    const auto & body = ped.body;
+    for (std::size_t i = 0; i < body.joints.size() && i < body.rotations.size(); ++i)
     {
-      const auto wire = wireIndex.find(joints.name[i]);
-      if (wire == wireIndex.end())
-      {
-        if (warnedJoints.insert(joints.name[i]).second)
-          gzwarn << "[PedSkeletonPlugin] unrecognized joint name '" << joints.name[i]
-                 << "', ignoring\n";
-        continue;
-      }
-      frame.angles[wire->second] = joints.position[i];
+      const auto & q = body.rotations[i];
+      frame.rotations[body.joints[i]] = gz::math::Quaterniond(q.w, q.x, q.y, q.z).Normalized();
     }
+    frame.rootOffset = gz::math::Vector3d(
+      body.root_offset.x, body.root_offset.y, body.root_offset.z);
+    for (std::size_t i = 0; i < joints.name.size() && i < joints.position.size(); ++i)
+      frame.drivers[joints.name[i]] = joints.position[i];
     auto & driver = boneDrivers[ped.name];
     driver.frames.push_back(std::move(frame));
     if (driver.frames.size() > kAngleBufferLen)
@@ -702,7 +602,7 @@ public:
             pendingRemovals.erase(ped.name);  // reappeared before removal ran
             if (!ped.model_uri.empty())
               pedModelPath[ped.name] = ped.model_uri;
-            if (!boneMap.empty() && !ped.joint_state.name.empty())
+            if (!ped.body.joints.empty() || !ped.joint_state.name.empty())
               PushWireFrame(*msg, ped);
           }
           // Names present last message but gone now are ejected: drop their
@@ -783,8 +683,9 @@ public:
     entry.actor = *root.Actor();
     entry.groundZ = entry.actor.RawPose().Pos().Z();
     entry.walkClipSeconds = WalkClipDuration(entry.actor, file);
-    if (!boneMap.empty())
-      LoadBoneDrive(entry, file, boneMap);
+#ifdef ARENA_GZ_BONE_TRANSFORMS
+    LoadBoneDrive(entry, file);
+#endif
     return &actorTemplates.emplace(path, std::move(entry)).first->second;
   }
 
@@ -809,14 +710,14 @@ public:
     return gaps > 0 ? sum / gaps : kDefaultPeriod;
   }
 
-  /// Angles at time t, linearly interpolated between the bracketing frames and
-  /// clamped at both ends. frames must be non-empty.
-  static std::vector<double> SampleWire(const std::deque<WireFrame> & frames, double t)
+  /// Frame at time t, interpolated between the bracketing frames and clamped
+  /// at both ends. frames must be non-empty.
+  static WireFrame SampleWire(const std::deque<WireFrame> & frames, double t)
   {
     if (frames.size() == 1 || t <= frames.front().stamp)
-      return frames.front().angles;
+      return frames.front();
     if (t >= frames.back().stamp)
-      return frames.back().angles;
+      return frames.back();
 
     const auto upper = std::upper_bound(
       frames.begin(), frames.end(), t,
@@ -828,18 +729,58 @@ public:
     const WireFrame & b = frames[idx + 1];
     const double span = b.stamp - a.stamp;
     const double alpha = span <= 0.0 ? 0.0 : (t - a.stamp) / span;
-    std::vector<double> angles(a.angles.size());
-    for (std::size_t k = 0; k < angles.size(); ++k)
-      angles[k] = (1.0 - alpha) * a.angles[k] + alpha * b.angles[k];
-    return angles;
+    WireFrame frame;
+    frame.stamp = t;
+    for (const auto & [name, rotation] : a.rotations)
+    {
+      const auto other = b.rotations.find(name);
+      frame.rotations[name] = gz::math::Quaterniond::Slerp(
+        alpha, rotation,
+        other == b.rotations.end() ? gz::math::Quaterniond::Identity : other->second, true);
+    }
+    for (const auto & [name, rotation] : b.rotations)
+    {
+      if (a.rotations.count(name) == 0)
+        frame.rotations[name] = gz::math::Quaterniond::Slerp(
+          alpha, gz::math::Quaterniond::Identity, rotation, true);
+    }
+    frame.rootOffset = a.rootOffset * (1.0 - alpha) + b.rootOffset * alpha;
+    for (const auto & [name, angle] : a.drivers)
+    {
+      const auto other = b.drivers.find(name);
+      frame.drivers[name] =
+        (1.0 - alpha) * angle + alpha * (other == b.drivers.end() ? 0.0 : other->second);
+    }
+    for (const auto & [name, angle] : b.drivers)
+    {
+      if (a.drivers.count(name) == 0)
+        frame.drivers[name] = alpha * angle;
+    }
+    return frame;
   }
 
-  /// Ramp the blend weight and slerp from the rest pose to the
-  /// delay-compensated wire angles composed onto the neutral stance. Caller
-  /// holds pedsMutex.
+  /// Local pose of every bone for one wire frame, through the rig.
+  static std::vector<gz::math::Pose3d> WirePose(const CachedActor & tmpl, const WireFrame & frame)
+  {
+    JointRotations driven;
+    for (const auto & driver : tmpl.rig.drivers)
+    {
+      const auto angle = frame.drivers.find(driver.name);
+      auto & turn = driven.try_emplace(driver.bone, gz::math::Quaterniond::Identity).first->second;
+      turn = turn * gz::math::Quaterniond(
+        driver.axis, angle == frame.drivers.end() ? 0.0 : angle->second);
+    }
+    return PoseBones(
+      tmpl.boneNames, tmpl.boneParents, tmpl.neutral,
+      BoneWorldRotations(tmpl.rig, WorldRotations(tmpl.rig, frame.rotations)), driven,
+      tmpl.rig.TopBone(), frame.rootOffset);
+  }
+
+  /// Ramp the blend weight and blend from the rest pose to the
+  /// delay-compensated wire pose. Caller holds pedsMutex.
   static void BlendWire(
     BoneDriver & driver, const CachedActor & tmpl, double simTime, double dt,
-    std::vector<gz::math::Quaterniond> & rotation)
+    std::vector<gz::math::Pose3d> & pose)
   {
     if (driver.frames.empty())
     {
@@ -854,18 +795,14 @@ public:
     if (driver.weight <= 0.0)
       return;
 
-    const std::vector<double> angles =
-      SampleWire(driver.frames, simTime - kInterpDelayPeriods * WirePeriod(driver.frames));
-    std::vector<gz::math::Quaterniond> wire(tmpl.neutral.size());
-    for (std::size_t b = 0; b < wire.size(); ++b)
-      wire[b] = tmpl.neutral[b].Rot();
-    for (const auto & entry : tmpl.schema)
+    const std::vector<gz::math::Pose3d> wire = WirePose(
+      tmpl, SampleWire(driver.frames, simTime - kInterpDelayPeriods * WirePeriod(driver.frames)));
+    for (std::size_t b = 0; b < pose.size(); ++b)
     {
-      const gz::math::Quaterniond delta(entry.axis, entry.gain * angles[entry.wireIdx]);
-      wire[entry.boneIdx] = (wire[entry.boneIdx] * delta).Normalized();
+      pose[b] = gz::math::Pose3d(
+        pose[b].Pos() + (wire[b].Pos() - pose[b].Pos()) * driver.weight,
+        gz::math::Quaterniond::Slerp(driver.weight, pose[b].Rot(), wire[b].Rot(), true));
     }
-    for (std::size_t b = 0; b < rotation.size(); ++b)
-      rotation[b] = gz::math::Quaterniond::Slerp(driver.weight, tmpl.rest[b], wire[b], true);
   }
 
   /// Local transform of every bone of a bone-driven template for one ped:
@@ -874,16 +811,18 @@ public:
   std::map<std::string, gz::math::Pose3d> EvaluateBones(
     const std::string & pedName, const CachedActor & tmpl, double simTime, double dt)
   {
-    std::vector<gz::math::Quaterniond> rotation = tmpl.rest;
+    std::vector<gz::math::Pose3d> pose(tmpl.neutral.size());
+    for (std::size_t b = 0; b < pose.size(); ++b)
+      pose[b] = gz::math::Pose3d(tmpl.neutral[b].Pos(), tmpl.rest[b]);
     {
       std::lock_guard<std::mutex> lock(pedsMutex);
       const auto driver = boneDrivers.find(pedName);
       if (driver != boneDrivers.end())
-        BlendWire(driver->second, tmpl, simTime, dt, rotation);
+        BlendWire(driver->second, tmpl, simTime, dt, pose);
     }
     std::map<std::string, gz::math::Pose3d> bones;
-    for (std::size_t b = 0; b < rotation.size(); ++b)
-      bones.emplace(tmpl.boneNames[b], gz::math::Pose3d(tmpl.neutral[b].Pos(), rotation[b]));
+    for (std::size_t b = 0; b < pose.size(); ++b)
+      bones.emplace(tmpl.boneNames[b], pose[b]);
     return bones;
   }
 
@@ -926,22 +865,6 @@ void PedSkeletonPlugin::Configure(
 #ifndef ARENA_GZ_BONE_TRANSFORMS
   gzwarn << "[PedSkeletonPlugin] built without BoneTransforms (no gz-sim overlay), "
          << "actors keep the clip-scrub path\n";
-#else
-  if (!_sdf->HasElement("bone_map"))
-  {
-    gzwarn << "[PedSkeletonPlugin] no <bone_map>, actors keep the clip-scrub path\n";
-  }
-  else
-  {
-    const auto bonePath = _sdf->Get<std::string>("bone_map");
-    if (LoadBoneMap(bonePath, dataPtr->boneMap))
-    {
-      for (std::size_t w = 0; w < dataPtr->boneMap.size(); ++w)
-        dataPtr->wireIndex.emplace(dataPtr->boneMap[w].first, w);
-      gzmsg << "[PedSkeletonPlugin] bone map '" << bonePath << "' maps "
-            << dataPtr->boneMap.size() << " wire joints\n";
-    }
-  }
 #endif
 
   if (!rclcpp::ok())

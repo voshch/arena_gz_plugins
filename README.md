@@ -6,7 +6,7 @@ gz-sim 8 (Harmonic) C++ plugins for Arena-Rosnav: server-side **system** plugins
 ## PedSkeletonPlugin
 
 Drives Gazebo **actor** pedestrians from the `arena_peds` topic: it positions
-each actor and poses its skeleton per bone from the wire joint angles, so the
+each actor and poses its skeleton per bone from the wire body pose, so the
 in-sim body renders the same articulated gait as Isaac.
 
 ### What it does
@@ -23,7 +23,7 @@ for every actor whose `Name` matches a `Pedestrian.name`:
    on each fresh sample, clamped to `kMaxExtrap`) so the body slides smoothly instead
    of stepping.
 2. **Skeleton**: sets `components::BoneTransforms`, the local transform of every
-   skin bone, from the ped's `joint_state` (see below). Templates that cannot be
+   skin bone, from the ped's `body` and `joint_state` (see below). Templates that cannot be
    bone-driven fall back to the clip scrub: when moving, `components::AnimationName`
    is the `walk` clip and `components::AnimationTime` advances by
    `speed / kWalkRefSpeed` per second, where `kWalkRefSpeed` is walk.dae's natural
@@ -43,23 +43,32 @@ Both components flow through gz's `RenderUtil` to the GUI **and** `gpu_lidar`.
 
 `components::BoneTransforms` (gz-sim) carries each skeleton bone's local transform
 by name and takes precedence over `AnimationName`/`AnimationTime` on the render side.
-The plugin fills it the way the Isaac provider does: the `<bone_map>` JSON maps each
-wire joint (`joint_state.name`) to bone targets (`bone`, bone-local `axis`, `sign`,
-`scale`), the rest pose is the `idle` clip's first frame per bone (the skin
-transform for the root and for bones without a channel), the neutral stance is the
-first frame of an optional `neutral` clip (the rest pose without one) with the legs
-(`UpLeg`, `Leg`, `Foot`, `ToeBase`) at their skin transform, thighs and shanks then
-swung to hang straight down and the feet keeping their skin orientation, and each tick
-the wire angles, buffered per ped and sampled 1.5 periods behind sim time, rotate
-their target bones about their axes on top of the neutral stance. A blend weight
-slerps from the rest pose to that wire pose and ramps to zero when the wire is older
-than 0.5 s, so a ped without a fresh wire shows the rest pose.
+The `rig/<name>.rig` beside the actor SDF maps the body rig of
+`BODY.md` onto the skin. It is a stored numpy zip read without dependencies:
+`joints` names each joint with its parent index and neutral-stance world rotation,
+`bones` the skin bones following a joint with an `offset` quaternion and a `weight`
+(several rows for one joint are a chain), `soles` the joints whose bones carry the
+sole points and `drivers` the driven joints with their `bones` and `axes`. A file with
+`rig/version` above 1 is ignored with a warning. Wire joints the rig lacks are ignored
+and rig joints missing from the wire stay in their stance.
+The rest pose is the `idle` clip's first frame per bone (the skin transform for the
+root and for bones without a channel). Each tick the ped's `Pedestrian.body`, buffered
+per ped and sampled 1.5 periods behind sim time, composes down the joint parents to a
+world rotation per joint `G`, a mapped bone's world rotation is `G * offset`, a chain
+bone takes the cumulative weight share of its joint's angle, and the bone's local
+rotation is taken against its parent bone. `root_offset` moves the top bone. Bones
+the rig does not map keep their neutral local rotation, the first frame of an optional
+`neutral` clip (the rest pose without one) with the mapped bones at the stance. Each
+`joint_state` entry turns its driver's bone about its axis on top of that neutral
+rotation. A blend weight slerps from the rest pose to that wire pose and ramps to zero
+when the wire is older than 0.5 s, so a ped without a fresh wire shows the rest pose.
 The actor then stands on its lowest sole point: a heel and a toe point per foot, the
-lowest skin vertices behind and ahead of the foot's middle, ride on their bones, and
-the actor moves along the wire pose's up axis each tick until the lowest of them is level
-with the pose, the floor for a standing ped. A rig on wheels
-(`WheelL`, `WheelR` bones) has none and keeps the SDF ground offset. A template without a
-bone map, a `.dae` idle clip or a skin skeleton keeps the clip-scrub path.
+lowest skin vertices behind and ahead of the foot's middle, ride on the bones of the
+`soles` joints, and the actor moves along the wire pose's up axis each tick until the
+lowest of them is level with the pose, the floor for a standing ped. A rig with a
+`from: distance` driver (a wheelchair) has none and keeps the SDF ground offset. A
+template without a `.rig` file, a `.dae` idle clip or a skin skeleton keeps
+the clip-scrub path. The pose math is in `include/arena_gz_plugins/BodyRig.hh`.
 
 `BoneTransforms` is not in stock gz-sim 8. It comes from the gz-sim overlay that
 `arena feature gazebo update` builds, which then rebuilds this package. CMake checks
@@ -69,7 +78,6 @@ actor.
 ```xml
 <plugin filename="PedSkeletonPlugin" name="arena_gz_plugins::PedSkeletonPlugin">
   <enabled>true</enabled>
-  <bone_map>/abs/path/bone_map.json</bone_map>
   <topic_suffix>/sim_peds</topic_suffix>
 </plugin>
 ```
@@ -99,7 +107,7 @@ The pedestrian is `arena_simulation_setup/assets/Common/Pedestrian/arenian/areni
 an `<actor>` with a skinned `<skin>` mesh and `<animation name="walk">` /
 `<animation name="idle">` clips. `idle` is the rest pose of the per-bone path
 and, with `walk`, the clip the fallback passes to `AnimationName`. A bundle whose
-rest pose is not the stance its wire angles assume (a seated wheelchair user) adds
+rest pose is not its neutral stance (a seated wheelchair user) adds
 `<animation name="neutral">` with that stance.
 
 ## ArticulatedDrive

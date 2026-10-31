@@ -13,9 +13,6 @@ find_package(gz-math7 REQUIRED)
 # gz-common 5 graphics (skin skeleton + idle clip for per-bone actor driving)
 find_package(gz-common5 REQUIRED COMPONENTS graphics)
 
-# bone map JSON
-find_package(nlohmann_json REQUIRED)
-
 # sdformat 14 (sdf::Root / sdf::Actor, for runtime actor creation)
 find_package(sdformat14 REQUIRED)
 
@@ -45,7 +42,6 @@ target_link_libraries(PedSkeletonPlugin PUBLIC
   gz-math7::gz-math7
   gz-common5::graphics
   sdformat14::sdformat14
-  nlohmann_json::nlohmann_json
   rclcpp::rclcpp
   ${arena_people_msgs_TARGETS}
 )
