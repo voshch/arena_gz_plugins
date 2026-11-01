@@ -766,7 +766,8 @@ public:
     for (const auto & driver : tmpl.rig.drivers)
     {
       const auto angle = frame.drivers.find(driver.name);
-      driven[driver.bone] = gz::math::Quaterniond(
+      auto & turn = driven.try_emplace(driver.bone, gz::math::Quaterniond::Identity).first->second;
+      turn = turn * gz::math::Quaterniond(
         driver.axis, angle == frame.drivers.end() ? 0.0 : angle->second);
     }
     return PoseBones(
